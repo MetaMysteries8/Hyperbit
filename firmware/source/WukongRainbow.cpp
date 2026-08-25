@@ -1,34 +1,19 @@
 #include "WukongRainbow.h"
 #include "CodalFiber.h"
-#include "nrf.h"
+#include "neopixel.h"
 #include <string.h>
 
 using namespace codal;
-
-// Timing routine adapted from Microsoft PXT's MIT-licensed micro:bit NeoPixel
-// implementation. It runs from RAM so flash wait states do not distort WS2812 timing.
-extern "C" void __attribute__((long_call, section(".data")))
-neopixel_send_buffer_nrf52(void *port500, uint32_t pinbr, const uint8_t *ptr, int numBytes);
 
 WukongRainbow::WukongRainbow(Pin &dataPin) : pin(dataPin) {
     memset(pixels, 0, sizeof(pixels));
 }
 
 void WukongRainbow::show() {
-    pin.setDigitalValue(0);
-    fiber_sleep(1);
-
-    auto port = pin.name < 32 ? NRF_P0 : NRF_P1;
-    uint32_t pinAndBrightness = (pin.name & 31) | (0x100UL << 20);
-
-    __disable_irq();
-    neopixel_send_buffer_nrf52(
-        (uint8_t *)(void *)port + 0x500,
-        pinAndBrightness,
-        pixels,
-        sizeof(pixels)
-    );
-    __enable_irq();
+    // micro:bit V2 enables HARDWARE_NEOPIXEL in CODAL. That implementation uses
+    // NRF_PWM2 instead of masking interrupts around a timing loop, so Rainbow
+    // updates can coexist with the SoftDevice. Speaker audio uses NRF_PWM1.
+    codal::neopixel_send_buffer(pin, pixels, sizeof(pixels));
 }
 
 void WukongRainbow::clear() {
@@ -55,15 +40,15 @@ void WukongRainbow::setAll(uint8_t r, uint8_t g, uint8_t b) {
 
 void WukongRainbow::state(uint8_t state) {
     switch (state) {
-        case 0: setAll(0, 0, 8); break;
-        case 1: setAll(0, 10, 2); break;
-        case 2: setAll(0, 18, 18); break;
-        case 3: setAll(20, 8, 0); break;
-        case 4: setAll(10, 0, 20); break;
-        case 5: setAll(20, 0, 20); break;
-        case 6: setAll(18, 18, 18); break;
-        case 7: setAll(24, 0, 0); break;
-        case 8: setAll(12, 8, 0); break;
+        case 0: setAll(0, 0, 8); break;       // disconnected
+        case 1: setAll(0, 10, 2); break;      // idle
+        case 2: setAll(0, 18, 18); break;     // listening
+        case 3: setAll(20, 8, 0); break;      // uploading
+        case 4: setAll(10, 0, 20); break;     // transcribing
+        case 5: setAll(20, 0, 20); break;     // thinking
+        case 6: setAll(18, 18, 18); break;    // speaking
+        case 7: setAll(24, 0, 0); break;      // error
+        case 8: setAll(12, 8, 0); break;      // muted
         default: clear(); break;
     }
 }
