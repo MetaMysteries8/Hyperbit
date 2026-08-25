@@ -48,7 +48,9 @@ class CodalOverrideTests(unittest.TestCase):
             HEADER,
             r"#define\s+HYPERBIT_CAP_BUFFERED_HVN\s+0x08",
         )
-        self.assertRegex(PC, r"^CAP_BUFFERED_HVN\s*=\s*0x08\s*$", re.M)
+        self.assertIsNotNone(
+            re.search(r"^CAP_BUFFERED_HVN\s*=\s*0x08\s*$", PC, re.M)
+        )
         required = re.search(r"^REQUIRED_CAPABILITIES\s*=\s*(.+)$", PC, re.M)
         self.assertIsNotNone(required)
         self.assertIn("CAP_BUFFERED_HVN", required.group(1))
