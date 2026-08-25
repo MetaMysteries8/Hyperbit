@@ -137,22 +137,23 @@ static bool stateIsBusyForPtt(uint8_t state) {
 static void kickHalfOpenConnection(VoiceBLEService &voice) {
     microbit_gaphandle_t handle = voice.getConnectionHandle();
     if (handle != BLE_CONN_HANDLE_INVALID) {
-        // Windows occasionally establishes the radio link and then stalls while
-        // enumerating GATT. The micro:bit has one peripheral connection slot,
-        // so evict that unusable session and let CODAL's onDisconnect() restart
-        // advertising automatically.
-        sd_ble_gap_disconnect(handle, BLE_HCI_REMOTE_USER_TERMINATED_CONNECTION);
+        // A raw Windows link can occasionally occupy the micro:bit without ever
+        // finishing GATT discovery. Evict it; CODAL then advertises again.
+        (void)sd_ble_gap_disconnect(handle, BLE_HCI_REMOTE_USER_TERMINATED_CONNECTION);
     }
 }
 
 int main() {
     uBit.init();
 
+    // Stop advertising before touching the Wukong's bit-banged WS2812 LEDs.
+    // Their current driver briefly masks IRQs and must not run while Nordic's
+    // SoftDevice is servicing advertising/connection radio events.
+    uBit.bleManager.stopAdvertising();
+
     VoiceBLEService voice;
     uBit.bleManager.setTransmitPower(7);
     uBit.bleManager.setAdvertiseOnDisconnect(true);
-    uBit.bleManager.stopAdvertising();
-    uBit.bleManager.advertise();
 
     uBit.audio.enable();
     uBit.audio.mic->setSampleRate(8000);
@@ -175,11 +176,17 @@ int main() {
 
     bool wukongBaseOk = baseLights.selfTest();
     rainbow.selfTest();
+    // Friendly steady blue on the four P16 RGB LEDs. Leave them at this value
+    // while BLE is running; the 8 blue I2C base LEDs remain animated.
+    rainbow.setAll(0, 6, 18);
     uBit.display.print(wukongBaseOk ? "H" : "W");
     uBit.sleep(350);
 
     AliveAnimator animator(uBit, baseLights, rainbow);
     animator.setState(PHYS_DISCONNECTED);
+
+    // Only begin radio activity after all interrupt-masking RGB writes are done.
+    uBit.bleManager.advertise();
 
     bool lastSessionReady = false;
     bool pttActive = false;
@@ -195,11 +202,10 @@ int main() {
     int interruptGraceTicks = 0;
     int animationDivider = 0;
 
-    // Main loop is ~10 ms/tick. If Windows owns the physical BLE link for ten
-    // seconds without subscribing to HyperBit's MIC + CONTROL notifications,
-    // it is a broken/half-open GATT connection and gets evicted.
+    // Main loop is ~10 ms/tick. A raw link that fails to subscribe to the two
+    // HyperBit notification characteristics within ~6 seconds is unusable.
     int halfOpenTicks = 0;
-    const int HALF_OPEN_LIMIT_TICKS = 1000;
+    const int HALF_OPEN_LIMIT_TICKS = 600;
 
     while (true) {
         bool rawConnected = voice.getConnected();
@@ -218,8 +224,6 @@ int main() {
         if (interruptGraceTicks > 0)
             --interruptGraceTicks;
 
-        // Only call HyperBit truly connected after GATT discovery completed and
-        // Windows subscribed to both notification characteristics.
         if (sessionReady != lastSessionReady) {
             lastSessionReady = sessionReady;
             if (sessionReady) {
