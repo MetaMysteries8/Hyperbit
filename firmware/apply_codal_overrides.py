@@ -94,13 +94,14 @@ def apply(samples_root: Path, config_path: Path) -> None:
         manager.write_text(manager_text, encoding="utf-8")
 
     linker_text = linker.read_text(encoding="utf-8")
+    # Emit one canonical spelling so CI can prove the exact patched boundaries.
     wanted_noinit = (
-        f"  NOINIT (rwx) : ORIGIN = 0x{noinit_origin:08X}, "
-        f"LENGTH = 0x{app_origin:08X} - 0x{noinit_origin:08X}"
+        f"  NOINIT (rwx) : ORIGIN = 0X{noinit_origin:08X}, "
+        f"LENGTH = 0X{app_origin:08X} - 0X{noinit_origin:08X}"
     )
     wanted_ram = (
-        f"  RAM (rwx) : ORIGIN = 0x{app_origin:08X}, "
-        f"LENGTH = 0x{ram_end:08X} - 0x{app_origin:08X}"
+        f"  RAM (rwx) : ORIGIN = 0X{app_origin:08X}, "
+        f"LENGTH = 0X{ram_end:08X} - 0X{app_origin:08X}"
     )
 
     old_noinit = (
@@ -122,7 +123,6 @@ def apply(samples_root: Path, config_path: Path) -> None:
         )
     linker.write_text(linker_text, encoding="utf-8")
 
-    # Read back and verify the exact strings that the compiler/linker will see.
     manager_final = manager.read_text(encoding="utf-8")
     linker_final = linker.read_text(encoding="utf-8")
     queue_line = (
@@ -136,8 +136,8 @@ def apply(samples_root: Path, config_path: Path) -> None:
 
     print(f"HyperBit CODAL override: codal={actual_commit}")
     print(f"HyperBit CODAL override: hvn_tx_queue_size={queue_size}")
-    print(f"HyperBit CODAL override: noinit_origin=0x{noinit_origin:08X}")
-    print(f"HyperBit CODAL override: application_ram_origin=0x{app_origin:08X}")
+    print(f"HyperBit CODAL override: noinit_origin=0X{noinit_origin:08X}")
+    print(f"HyperBit CODAL override: application_ram_origin=0X{app_origin:08X}")
 
 
 def main() -> None:
