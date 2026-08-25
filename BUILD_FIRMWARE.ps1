@@ -8,6 +8,7 @@ $BuildRoot = Join-Path $Root ".firmware-build"
 $Samples = Join-Path $BuildRoot "microbit-v2-samples"
 $Firmware = Join-Path $Root "firmware"
 $OutHex = Join-Path $Firmware "HyperBit.hex"
+$OverrideScript = Join-Path $Firmware "apply_codal_overrides.py"
 
 function Banner($s) {
     Write-Host ""
@@ -93,10 +94,19 @@ if (-not (Test-Path (Join-Path $Samples ".git"))) {
     Push-Location $Samples
     try {
         & git fetch --depth 1 origin master
+        if ($LASTEXITCODE -ne 0) { throw "git fetch failed" }
         & git reset --hard origin/master
         if ($LASTEXITCODE -ne 0) { throw "git update failed" }
     } finally {
         Pop-Location
+    }
+}
+
+# build/ and libraries/ are untracked by the samples repository. Delete both so
+# a local rebuild cannot accidentally reuse an older configured CODAL tree.
+foreach ($stale in @((Join-Path $Samples "build"), (Join-Path $Samples "libraries"))) {
+    if (Test-Path $stale) {
+        Remove-Item -Recurse -Force $stale
     }
 }
 
@@ -106,19 +116,26 @@ Get-ChildItem $SampleSource -File | Remove-Item -Force
 Copy-Item (Join-Path $Firmware "source\*") $SampleSource -Force
 Copy-Item (Join-Path $Firmware "codal.json") (Join-Path $Samples "codal.json") -Force
 
+Banner "Configuring CODAL"
+& cmake -S $Samples -B (Join-Path $Samples "build") -DCMAKE_BUILD_TYPE=RelWithDebInfo -G Ninja
+if ($LASTEXITCODE -ne 0) {
+    throw "CODAL CMake configure failed with exit code $LASTEXITCODE"
+}
+
+Banner "Applying reviewed HyperBit SoftDevice transport overrides"
+if ($Python.Count -eq 2) {
+    & $Python[0] $Python[1] $OverrideScript --samples-root $Samples
+} else {
+    & $Python[0] $OverrideScript --samples-root $Samples
+}
+if ($LASTEXITCODE -ne 0) {
+    throw "HyperBit CODAL override failed with exit code $LASTEXITCODE"
+}
+
 Banner "Compiling micro:bit V2 firmware"
-Push-Location $Samples
-try {
-    if ($Python.Count -eq 2) {
-        & $Python[0] $Python[1] "build.py"
-    } else {
-        & $Python[0] "build.py"
-    }
-    if ($LASTEXITCODE -ne 0) {
-        throw "CODAL build failed with exit code $LASTEXITCODE"
-    }
-} finally {
-    Pop-Location
+& cmake --build (Join-Path $Samples "build") --parallel 10
+if ($LASTEXITCODE -ne 0) {
+    throw "CODAL build failed with exit code $LASTEXITCODE"
 }
 
 $BuiltHex = Join-Path $Samples "MICROBIT.hex"
@@ -132,4 +149,5 @@ Banner "SUCCESS"
 Write-Host "Real compiled firmware:" -ForegroundColor Green
 Write-Host "  $OutHex"
 Write-Host ""
+Write-Host "This build includes the reviewed SoftDevice HVN queue/RAM override from firmware\codal_overrides.json."
 Write-Host "Now connect the micro:bit V2 by its OWN USB port and run FLASH_FIRMWARE.bat."
