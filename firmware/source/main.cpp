@@ -203,9 +203,9 @@ int main() {
     int animationDivider = 0;
 
     // Main loop is ~10 ms/tick. A raw link that fails to subscribe to the two
-    // HyperBit notification characteristics within ~6 seconds is unusable.
+    // HyperBit notification characteristics within ~12 seconds is unusable.
     int halfOpenTicks = 0;
-    const int HALF_OPEN_LIMIT_TICKS = 600;
+    const int HALF_OPEN_LIMIT_TICKS = 1200;
 
     while (true) {
         bool rawConnected = voice.getConnected();
