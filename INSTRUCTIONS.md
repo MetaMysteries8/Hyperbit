@@ -4,7 +4,7 @@
 
 Download the latest `HyperBit-release.zip` and extract the **whole** ZIP. Use the `HyperBit.hex` and PC files from that same release together.
 
-The PC agent now validates the firmware revision during HELLO/READY, so accidentally mixing a new PC agent with an old flashed HEX produces an explicit stale-firmware error instead of a mysterious connection failure.
+The PC agent validates the firmware revision and capabilities during HELLO/READY, so accidentally mixing a new PC agent with an old flashed HEX produces an explicit stale-firmware error instead of a mysterious connection failure.
 
 ## 2. Flash the firmware
 
@@ -40,7 +40,7 @@ This mode requires **no Hyper API key**. It tests only:
 - protocol + firmware revision + capability validation,
 - a two-second post-handshake stability window.
 
-A current board should report protocol v2 and firmware revision r3 or newer.
+A current board should report **protocol v2, firmware revision r4 or newer, and the buffered-HVN capability**.
 
 During the raw connection/handshake window the 5×5 display intentionally goes **black**. Firmware disables the matrix refresh driver and does no animation, accelerometer, Wukong, microphone, speaker, or button work until READY has been successfully queued. That is deliberate connection isolation, not a frozen fluid renderer.
 
@@ -93,9 +93,11 @@ The 5×5 matrix and Wukong lights show disconnected, idle, listening, uploading,
 
 HyperBit does not store a whole conversation-sized audio file on the micro:bit.
 
-Microphone audio is streamed as tiny BLE packets while the logo is held through a 512-byte ring buffer. TTS is split by the PC into at most 512 ADPCM bytes per acknowledged segment, with each segment further divided into <=20-byte NUS frames.
+Microphone audio is 8 kHz mono IMA ADPCM streamed as tiny BLE packets while the logo is held through a 512-byte ring buffer. Firmware r4 also configures a 12-entry Nordic SoftDevice notification queue so brief Windows connection-event scheduling gaps do not immediately force the application into one-packet-at-a-time backpressure.
 
-Audio is 8 kHz mono IMA ADPCM.
+TTS is split by the PC into at most 512 ADPCM bytes per acknowledged segment, with each segment further divided into <=20-byte NUS frames.
+
+If the microphone transport still cannot keep up, the firmware/PC marks the utterance as overflowed or packet-gapped instead of silently treating damaged ADPCM as clean audio.
 
 ## 8. Disconnect recovery
 
@@ -103,12 +105,25 @@ After a valid voice session has connected, an unexpected Bluetooth disconnect no
 
 Firmware also evicts a raw half-open Windows connection after about 45 seconds so the board can advertise again.
 
+## 9. Building locally
+
+Normal users should use the compiled release HEX. If you intentionally build from source, `BUILD_FIRMWARE.bat` now reproduces the release build order:
+
+1. reset the official `microbit-v2-samples` checkout,
+2. remove stale generated `build/` and `libraries/` trees,
+3. inject this checkout's firmware,
+4. CMake-configure the locked CODAL dependencies,
+5. run `firmware/apply_codal_overrides.py`, which verifies the expected CODAL commit and applies the reviewed notification-queue/RAM layout,
+6. compile the HEX.
+
+The override is fail-closed: an unexpected CODAL revision/source layout must be reviewed rather than patched blindly.
+
 ## Troubleshooting order
 
 Use this order so failures stay isolated:
 
 1. Confirm Wukong boot self-test.
 2. Flash the `HyperBit.hex` from the same release ZIP as the PC agent.
-3. Run `TEST_BLE.bat` until protocol/firmware validation is stable.
+3. Run `TEST_BLE.bat` until protocol v2 / firmware r4 validation is stable.
 4. Only then configure the Hyper API key and run full voice mode.
 5. If full mode fails after BLE passes, the problem is above the transport layer (dependencies, Whisper, Hyper API, or TTS) rather than firmware discovery.
