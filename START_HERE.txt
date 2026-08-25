@@ -1,0 +1,17 @@
+HYPERBIT - START HERE
+
+YOU DO NOT NEED TO KNOW HOW TO COMPILE C++.
+
+1. Extract the whole ZIP.
+2. Double-click MAKE_THE_HEX.bat.
+3. Wait. It installs the required tools and compiles the firmware.
+4. When it says DONE, your real .hex is:
+
+   firmware\HyperBit.hex
+
+5. Plug the micro:bit V2 itself into your PC over USB.
+6. Double-click FLASH_FIRMWARE.bat.
+7. Edit config.cmd with your Hyper API key.
+8. Double-click RUN_AGENT.bat.
+
+If MAKE_THE_HEX.bat fails, send ChatGPT a screenshot of the last error lines.

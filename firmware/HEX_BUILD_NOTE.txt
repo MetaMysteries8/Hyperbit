@@ -1,0 +1,2 @@
+HyperBit.hex is created by BUILD_FIRMWARE.bat using Lancaster University's official CODAL build system.
+It is intentionally not a renamed/fake file.

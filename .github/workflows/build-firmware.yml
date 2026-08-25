@@ -1,0 +1,88 @@
+name: Build HyperBit
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "firmware/**"
+      - ".github/workflows/build-firmware.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "firmware/**"
+      - ".github/workflows/build-firmware.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Compile micro:bit V2 firmware
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout HyperBit
+        uses: actions/checkout@v4
+
+      - name: Install ARM/CODAL build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-arm-none-eabi \
+            binutils-arm-none-eabi \
+            cmake \
+            ninja-build \
+            git \
+            python3 \
+            python3-pip \
+            rsync \
+            zip
+
+      - name: Clone official micro:bit V2 CODAL samples
+        run: |
+          git clone --depth 1 \
+            https://github.com/lancaster-university/microbit-v2-samples.git \
+            .build/microbit-v2-samples
+
+      - name: Inject HyperBit firmware
+        run: |
+          rm -f .build/microbit-v2-samples/source/*
+          cp firmware/source/* .build/microbit-v2-samples/source/
+          cp firmware/codal.json .build/microbit-v2-samples/codal.json
+
+      - name: Compile HyperBit.hex
+        working-directory: .build/microbit-v2-samples
+        run: python3 build.py
+
+      - name: Prepare downloadable package
+        run: |
+          test -f .build/microbit-v2-samples/MICROBIT.hex
+          cp .build/microbit-v2-samples/MICROBIT.hex firmware/HyperBit.hex
+
+          mkdir -p dist/package
+          cp firmware/HyperBit.hex dist/HyperBit.hex
+
+          rsync -a ./ dist/package/ \
+            --exclude '.git/' \
+            --exclude '.build/' \
+            --exclude 'dist/' \
+            --exclude '.venv/' \
+            --exclude '__pycache__/' \
+            --exclude 'config.cmd'
+
+          (cd dist/package && zip -qr ../HyperBit-Windows-PC.zip .)
+
+          echo "### HyperBit build complete" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`HyperBit.hex\`: flash directly to a micro:bit V2" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`HyperBit-Windows-PC.zip\`: complete Windows package with the compiled HEX included" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload firmware + complete Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: HyperBit-build
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            dist/HyperBit.hex
+            dist/HyperBit-Windows-PC.zip

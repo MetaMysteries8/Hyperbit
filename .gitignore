@@ -1,0 +1,9 @@
+.venv/
+.firmware-build/
+.build/
+dist/
+__pycache__/
+*.pyc
+config.cmd
+agent_home/conversation.json
+firmware/HyperBit.hex
