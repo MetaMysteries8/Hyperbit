@@ -55,6 +55,12 @@ public:
     bool sendControl(uint8_t code, uint8_t a=0, uint8_t b=0, uint8_t c=0);
     bool sendMic(uint8_t seq, const uint8_t *data, int len);
 
+    // A raw BLE radio link is not enough to call HyperBit ready. Windows must
+    // finish GATT discovery and subscribe to both notification channels first.
+    bool notificationsReady() {
+        return getConnected() && notifyChrValueEnabled(HB_MIC) && notifyChrValueEnabled(HB_CONTROL);
+    }
+
     bool ttsReady() const { return ttsReadyFlag; }
     void clearTtsReady() { ttsReadyFlag = false; }
     void abortTts();

@@ -21,7 +21,6 @@ AliveAnimator::AliveAnimator(MicroBit &microbit, WukongLights &baseLights, Wukon
     lastBaseLevel(255),
     baseDynamic(false)
 {
-    // Start the five particles spread around the face.
     const int16_t sx[5] = {256, 768, 512, 128, 896};
     const int16_t sy[5] = {256, 256, 512, 832, 832};
     for (int i = 0; i < 5; ++i) {
@@ -50,8 +49,6 @@ void AliveAnimator::setState(uint8_t state) {
     if (state == PHYS_DISCONNECTED) {
         base.breath();
     } else {
-        // Enter steady mode once; subsequent animation frames only update the
-        // brightness register, avoiding the old 100 ms pause every frame.
         base.steady(18);
         baseDynamic = true;
     }
@@ -74,20 +71,18 @@ void AliveAnimator::plot(int x, int y, uint8_t value) {
 void AliveAnimator::renderFluid(int ax, int ay, bool dimmer) {
     clearMatrix();
 
-    // The board reports acceleration in milli-g. Turn that into a gentle
-    // gravity vector. The Y sign is inverted to match display coordinates.
+    // Match the physical micro:bit V2 orientation: with the board upright
+    // (gold logo at the top), gravity must pull the liquid toward display row 4.
     int gx = clampi(ax / 52, -20, 20);
-    int gy = clampi(-ay / 52, -20, 20);
+    int gy = clampi(ay / 52, -20, 20);
 
     for (int i = 0; i < 5; ++i) {
         vx[i] += gx;
         vy[i] += gy;
 
-        // Tiny deterministic swirl keeps the blob alive even when perfectly flat.
         vx[i] += ((int)((frame + i * 7) % 11) - 5) / 2;
         vy[i] += ((int)((frame * 3 + i * 5) % 9) - 4) / 2;
 
-        // Fluid-ish drag.
         vx[i] = (vx[i] * 29) / 32;
         vy[i] = (vy[i] * 29) / 32;
 
@@ -120,14 +115,12 @@ void AliveAnimator::renderListening(uint8_t level) {
     int core = 150 + pulse / 3;
     int ring = 28 + pulse / 2;
 
-    // Compact center mass.
     plot(2, 2, core);
     plot(2, 1, 95 + pulse / 3);
     plot(2, 3, 95 + pulse / 3);
     plot(1, 2, 95 + pulse / 3);
     plot(3, 2, 95 + pulse / 3);
 
-    // Voice energy makes the blob breathe outward.
     if (pulse > 45) {
         plot(1, 1, ring);
         plot(3, 1, ring);
@@ -163,7 +156,6 @@ void AliveAnimator::renderSpeaking(uint8_t level) {
     int pulse = clampi(level, 0, 255);
     int wobble = ((frame / 2) & 1) ? 1 : 0;
 
-    // Different silhouette from listening: a soft horizontal two-lobed "voice" blob.
     plot(1, 2, 120 + pulse / 3);
     plot(3, 2, 120 + pulse / 3);
     plot(2, 2, 65 + pulse / 4);
@@ -205,7 +197,6 @@ void AliveAnimator::updateBodyGlow(uint8_t level) {
     if (stateValue == PHYS_DISCONNECTED || !baseDynamic)
         return;
 
-    // I2C body glow only updates every ~120 ms when tick() runs around 30 ms.
     if (++baseDivider < 4)
         return;
     baseDivider = 0;
@@ -234,72 +225,14 @@ void AliveAnimator::updateBodyGlow(uint8_t level) {
 }
 
 void AliveAnimator::renderWukong(int ax, int ay, uint8_t level) {
-    int xbias = clampi(128 + ax / 8, 0, 255);
-    int ybias = clampi(128 - ay / 8, 0, 255);
-
-    switch (stateValue) {
-        case PHYS_DISCONNECTED:
-        case PHYS_IDLE: {
-            // Four LEDs form a little pool whose brightest corner follows gravity.
-            int weights[4] = {
-                (255 - xbias) + (255 - ybias),
-                xbias + (255 - ybias),
-                (255 - xbias) + ybias,
-                xbias + ybias
-            };
-            for (int i = 0; i < 4; ++i) {
-                int b = 3 + weights[i] / 30;
-                if (stateValue == PHYS_DISCONNECTED) b /= 2;
-                rainbow.setPixel(i, 0, (uint8_t)(b + 4), (uint8_t)(b + 12));
-            }
-            rainbow.show();
-            break;
-        }
-
-        case PHYS_LISTENING: {
-            int b = 8 + level / 10;
-            for (int i = 0; i < 4; ++i)
-                rainbow.setPixel(i, 0, (uint8_t)(b + 8), (uint8_t)(b + 12));
-            rainbow.show();
-            break;
-        }
-
-        case PHYS_THINKING: {
-            int head = (frame / 3) & 3;
-            for (int i = 0; i < 4; ++i) {
-                int d = (i - head + 4) & 3;
-                uint8_t b = d == 0 ? 28 : (d == 1 ? 10 : 3);
-                rainbow.setPixel(i, b / 2, 0, b);
-            }
-            rainbow.show();
-            break;
-        }
-
-        case PHYS_SPEAKING: {
-            int b = 7 + level / 9;
-            int wobble = (frame / 2) & 1;
-            rainbow.setPixel(0, (uint8_t)(b / 2), (uint8_t)(b + 3), (uint8_t)(b + 7));
-            rainbow.setPixel(3, (uint8_t)(b / 2), (uint8_t)(b + 3), (uint8_t)(b + 7));
-            rainbow.setPixel(1, (uint8_t)(wobble ? b : b / 3), (uint8_t)(b / 2), (uint8_t)(b + 5));
-            rainbow.setPixel(2, (uint8_t)(wobble ? b / 3 : b), (uint8_t)(b / 2), (uint8_t)(b + 5));
-            rainbow.show();
-            break;
-        }
-
-        case PHYS_ERROR:
-            rainbow.setAll(28, 0, 0);
-            break;
-        case PHYS_MUTED:
-            rainbow.setAll(10, 5, 0);
-            break;
-        case PHYS_UPLOADING:
-        case PHYS_TRANSCRIBING:
-        default: {
-            int b = 5 + ((frame % 20) < 10 ? frame % 10 : 20 - (frame % 20));
-            rainbow.setAll((uint8_t)(b / 2), 0, (uint8_t)(b + 8));
-            break;
-        }
-    }
+    // Intentionally no live P16 WS2812 writes here. WukongRainbow::show()
+    // currently masks IRQs around a bit-banged transfer, which is unsafe while
+    // Nordic's BLE SoftDevice is active and can provoke panic 070. The four RGB
+    // LEDs are set once before BLE advertising begins; the 8 blue I2C base LEDs
+    // remain animated here without interrupt masking.
+    (void)ax;
+    (void)ay;
+    (void)level;
 }
 
 void AliveAnimator::tick() {
@@ -311,7 +244,6 @@ void AliveAnimator::tick() {
 
     if (mutedValue && stateValue != PHYS_LISTENING && stateValue != PHYS_UPLOADING) {
         renderBusyPulse();
-        renderWukong(ax, ay, 0);
         updateBodyGlow(0);
         return;
     }

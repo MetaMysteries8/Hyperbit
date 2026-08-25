@@ -122,8 +122,12 @@ class HyperBitBLE:
             if attempt == 1:
                 dev = await self._find()
             else:
-                print(f"[ble] retry {attempt}/{len(attempts)}: rescanning before {label}...")
-                await asyncio.sleep(1.0)
+                # A failed Windows GATT connect can leave the peripheral link
+                # occupied briefly. Give firmware cleanup/re-advertising time,
+                # then scan through the recovery window instead of instantly
+                # declaring the board missing.
+                print(f"[ble] retry {attempt}/{len(attempts)}: waiting for BLE recovery before {label}...")
+                await asyncio.sleep(5.0)
                 dev = await self._find()
 
             print(
