@@ -4,61 +4,39 @@
 #include "VoiceBLEService.h"
 #include "WukongLights.h"
 #include "WukongRainbow.h"
+#include "AliveAnimator.h"
 #include "ImaAdpcm.h"
 
 using namespace codal;
 MicroBit uBit;
 
-enum PhysicalState {
-    PHYS_DISCONNECTED = 0,
-    PHYS_IDLE = 1,
-    PHYS_LISTENING = 2,
-    PHYS_UPLOADING = 3,
-    PHYS_TRANSCRIBING = 4,
-    PHYS_THINKING = 5,
-    PHYS_SPEAKING = 6,
-    PHYS_ERROR = 7,
-    PHYS_MUTED = 8
-};
-
-static void applyState(WukongLights &base, WukongRainbow &rainbow, uint8_t state, bool muted) {
-    if (muted && state != PHYS_LISTENING && state != PHYS_UPLOADING) {
-        base.steady(8);
-        rainbow.state(PHYS_MUTED);
-        return;
-    }
-
-    switch (state) {
-        case PHYS_DISCONNECTED: base.breath(); break;
-        case PHYS_IDLE: base.steady(12); break;
-        case PHYS_LISTENING: base.steady(45); break;
-        case PHYS_UPLOADING: base.steady(65); break;
-        case PHYS_TRANSCRIBING: base.steady(70); break;
-        case PHYS_THINKING: base.steady(85); break;
-        case PHYS_SPEAKING: base.steady(100); break;
-        case PHYS_ERROR: base.steady(100); break;
-        default: base.steady(12); break;
-    }
-
-    rainbow.state(state);
-}
-
 static bool playTtsInterruptible(
     MemorySource &source,
     ImaAdpcmState &decoder,
+    AliveAnimator &animator,
     const uint8_t *adpcm,
     uint16_t len
 ) {
     uint8_t pcm[256];
     int out = 0;
+    int peak = 0;
+
+    animator.setState(PHYS_SPEAKING);
 
     for (uint16_t i = 0; i < len; ++i) {
-        if (uBit.buttonA.isPressed())
+        if (uBit.buttonA.isPressed()) {
+            animator.setOutputLevel(0);
             return false;
+        }
 
         uint8_t b = adpcm[i];
         int16_t s0 = decoder.decode(b & 0x0F);
         int16_t s1 = decoder.decode((b >> 4) & 0x0F);
+
+        int a0 = s0 < 0 ? -((int)s0) : (int)s0;
+        int a1 = s1 < 0 ? -((int)s1) : (int)s1;
+        if (a0 > peak) peak = a0;
+        if (a1 > peak) peak = a1;
 
         int p0 = (s0 >> 8) + 128;
         int p1 = (s1 >> 8) + 128;
@@ -72,13 +50,24 @@ static bool playTtsInterruptible(
 
         if (out >= (int)sizeof(pcm)) {
             source.play(pcm, out);
+            int level = peak >> 7;
+            if (level > 255) level = 255;
+            animator.setOutputLevel((uint8_t)level);
+            animator.tick();
+            peak = 0;
             out = 0;
         }
     }
 
-    if (out)
+    if (out) {
         source.play(pcm, out);
+        int level = peak >> 7;
+        if (level > 255) level = 255;
+        animator.setOutputLevel((uint8_t)level);
+        animator.tick();
+    }
 
+    animator.setOutputLevel(0);
     return !uBit.buttonA.isPressed();
 }
 
@@ -124,6 +113,25 @@ static void finishMicUtterance(VoiceBLEService &ble, MicRecorder &rec, uint8_t &
     ble.sendControl(HB_EVT_PTT_END, low, mid, high);
 }
 
+static uint8_t visualStateFromPc(uint8_t pcState) {
+    switch (pcState) {
+        case 1: return PHYS_IDLE;
+        case 2: return PHYS_LISTENING;
+        case 3: return PHYS_TRANSCRIBING;
+        case 4: return PHYS_THINKING;
+        case 5: return PHYS_SPEAKING;
+        case 6: return PHYS_ERROR;
+        default: return PHYS_IDLE;
+    }
+}
+
+static bool stateIsBusyForPtt(uint8_t state) {
+    return state == PHYS_UPLOADING ||
+           state == PHYS_TRANSCRIBING ||
+           state == PHYS_THINKING ||
+           state == PHYS_SPEAKING;
+}
+
 int main() {
     uBit.init();
 
@@ -145,21 +153,25 @@ int main() {
 
     SplitterChannel *micChannel = uBit.audio.splitter->createChannel();
     MicRecorder recorder(*micChannel);
-
-    // The physical microphone is OFF at rest. It is activated only while the
-    // V2 gold logo at the top of the board is held.
     recorder.stop();
     uBit.audio.deactivateMic();
 
     WukongLights baseLights(uBit.i2c);
     WukongRainbow rainbow(uBit.io.P16);
 
-    // Visible Wukong self-test at boot.
+    // Keep the boot diagnostic the user liked: W means the base-light I2C
+    // controller did not answer; H means Wukong was detected. The animation
+    // takes over immediately afterward instead of hanging on the letter.
     bool wukongBaseOk = baseLights.selfTest();
     rainbow.selfTest();
+    uBit.display.print(wukongBaseOk ? "H" : "W");
+    uBit.sleep(350);
+
+    AliveAnimator animator(uBit, baseLights, rainbow);
+    animator.setState(PHYS_DISCONNECTED);
 
     bool lastConnected = false;
-    bool lastLogo = false;
+    bool pttActive = false;
     bool lastA = false;
     bool lastB = false;
     bool lastAB = false;
@@ -169,25 +181,32 @@ int main() {
     uint8_t micSequence = 0;
     ImaAdpcmState ttsDecoder;
 
-    applyState(baseLights, rainbow, PHYS_DISCONNECTED, muted);
-    uBit.display.print(wukongBaseOk ? "H" : "W");
+    // About three seconds. While the agent is busy, push-to-talk is only
+    // accepted during this grace window after A has interrupted the old task.
+    int interruptGraceTicks = 0;
+    int animationDivider = 0;
 
     while (true) {
         bool connected = voice.getConnected();
 
+        if (interruptGraceTicks > 0)
+            --interruptGraceTicks;
+
         if (connected != lastConnected) {
             lastConnected = connected;
             if (connected) {
-                applyState(baseLights, rainbow, PHYS_IDLE, muted);
-                uBit.display.print("I");
+                animator.setState(PHYS_IDLE);
                 voice.sendControl(HB_EVT_READY);
                 voice.sendControl(HB_EVT_WUKONG_STATUS, baseLights.ok() ? 1 : 0);
             } else {
-                recorder.stop();
+                if (pttActive) {
+                    recorder.stop();
+                    pttActive = false;
+                }
                 uBit.audio.deactivateMic();
                 voice.abortTts();
-                applyState(baseLights, rainbow, PHYS_DISCONNECTED, muted);
-                uBit.display.print("X");
+                animator.setState(PHYS_DISCONNECTED);
+                lastPcState = 255;
             }
         }
 
@@ -197,20 +216,21 @@ int main() {
 
         if (ab && !lastAB) {
             muted = !muted;
+            animator.setMuted(muted);
             voice.sendControl(HB_EVT_MUTE_CHANGED, muted ? 1 : 0);
-            applyState(baseLights, rainbow, muted ? PHYS_MUTED : PHYS_IDLE, muted);
-            uBit.display.print(muted ? "M" : "I");
         } else if (!ab) {
             if (a && !lastA) {
+                // A is a real interruption: stop playback, tell the PC to
+                // discard the in-flight answer, and briefly arm busy-state PTT.
                 voice.abortTts();
                 voice.sendControl(HB_EVT_CANCEL);
-                uBit.display.print("C");
-                applyState(baseLights, rainbow, PHYS_IDLE, muted);
+                interruptGraceTicks = 300;
+                animator.setState(PHYS_IDLE);
+                lastPcState = voice.pcState();
             }
 
             if (b && !lastB) {
                 voice.sendControl(HB_EVT_REPLAY);
-                uBit.display.print("B");
             }
         }
 
@@ -221,6 +241,7 @@ int main() {
         if (connected && voice.ttsReady() && !speaking) {
             speaking = true;
             recorder.stop();
+            pttActive = false;
             uBit.audio.deactivateMic();
 
             if (voice.ttsFirstSegment())
@@ -228,11 +249,10 @@ int main() {
 
             bool completed = true;
             if (!muted) {
-                uBit.display.print("S");
-                applyState(baseLights, rainbow, PHYS_SPEAKING, muted);
                 completed = playTtsInterruptible(
                     ttsSource,
                     ttsDecoder,
+                    animator,
                     voice.ttsData(),
                     voice.ttsLength()
                 );
@@ -241,71 +261,65 @@ int main() {
             voice.clearTtsReady();
             voice.sendControl(HB_EVT_TTS_SEGMENT_DONE, completed ? 1 : 0);
 
-            if (!completed)
+            if (!completed) {
                 voice.sendControl(HB_EVT_CANCEL);
+                // Playback can only return early through A, so let the user
+                // immediately hold the gold logo to replace the interrupted reply.
+                interruptGraceTicks = 300;
+            }
 
             speaking = false;
             lastPcState = 255;
         }
 
         uint8_t pcState = voice.pcState();
-        if (connected && !speaking && pcState != lastPcState) {
+        if (connected && !speaking && !pttActive && pcState != lastPcState) {
             lastPcState = pcState;
-            switch (pcState) {
-                case 1:
-                    applyState(baseLights, rainbow, PHYS_IDLE, muted);
-                    uBit.display.print(muted ? "M" : "I");
-                    break;
-                case 2:
-                    applyState(baseLights, rainbow, PHYS_LISTENING, muted);
-                    uBit.display.print("L");
-                    break;
-                case 3:
-                    applyState(baseLights, rainbow, PHYS_TRANSCRIBING, muted);
-                    uBit.display.print("R");
-                    break;
-                case 4:
-                    applyState(baseLights, rainbow, PHYS_THINKING, muted);
-                    uBit.display.print("T");
-                    break;
-                case 5:
-                    applyState(baseLights, rainbow, PHYS_SPEAKING, muted);
-                    uBit.display.print("S");
-                    break;
-                case 6:
-                    applyState(baseLights, rainbow, PHYS_ERROR, muted);
-                    uBit.display.print("E");
-                    break;
-                default:
-                    applyState(baseLights, rainbow, PHYS_IDLE, muted);
-                    break;
-            }
+            animator.setState(visualStateFromPc(pcState));
         }
 
-        // The V2 gold logo at the top is the ONLY push-to-talk input.
-        bool logo = connected && !speaking && uBit.logo.isPressed();
+        // V2 GOLD LOGO = push-to-talk. It works freely while idle. If HyperBit
+        // is busy, A must have just interrupted the old operation first.
+        bool logoTouched = uBit.logo.isPressed();
+        bool busy = stateIsBusyForPtt(animator.state());
+        bool logoAllowed = connected && !speaking && (!busy || interruptGraceTicks > 0);
+        bool logo = logoTouched && logoAllowed;
 
-        if (logo && !lastLogo) {
+        if (logo && !pttActive) {
+            if (busy) {
+                // Consume the grace window and reinforce cancellation on the PC.
+                interruptGraceTicks = 0;
+                voice.sendControl(HB_EVT_CANCEL);
+            }
+
             micSequence = 0;
             uBit.audio.activateMic();
             recorder.start();
+            pttActive = true;
             voice.sendControl(HB_EVT_PTT_START);
-            applyState(baseLights, rainbow, PHYS_LISTENING, muted);
-            uBit.display.print("L");
+            animator.setState(PHYS_LISTENING);
         }
 
-        if (logo) {
-            // Stream microphone ADPCM in tiny BLE packets while the logo is held.
-            drainMicPackets(voice, recorder, micSequence, false);
+        if (pttActive) {
+            if (logoTouched) {
+                animator.setInputLevel(recorder.level());
+                drainMicPackets(voice, recorder, micSequence, false);
+            } else {
+                animator.setInputLevel(0);
+                animator.setState(PHYS_UPLOADING);
+                finishMicUtterance(voice, recorder, micSequence);
+                pttActive = false;
+            }
         }
 
-        if (!logo && lastLogo) {
-            applyState(baseLights, rainbow, PHYS_UPLOADING, muted);
-            uBit.display.print("U");
-            finishMicUtterance(voice, recorder, micSequence);
+        // ~33 fps visual loop without blocking the BLE/audio loop.
+        if (++animationDivider >= 3) {
+            animationDivider = 0;
+            if (pttActive)
+                animator.setInputLevel(recorder.level());
+            animator.tick();
         }
 
-        lastLogo = logo;
         uBit.sleep(10);
     }
 
