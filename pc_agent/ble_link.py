@@ -48,18 +48,44 @@ class HyperBitBLE:
         print("[ble] scanning 10 seconds...")
         found = await BleakScanner.discover(timeout=10.0, return_adv=True)
         candidates = []
+        seen = []
+
         for _k, pair in found.items():
             device, adv = pair
             name = adv.local_name or device.name or ""
+            service_uuids = [u.lower() for u in (adv.service_uuids or [])]
+            seen.append((name or "<unnamed>", device.address, service_uuids))
+
             if self.address and device.address.lower() == self.address.lower():
+                print(f"[ble] matched requested address: {device.address}")
                 return device
+
             if self.name_hint and self.name_hint.lower() in name.lower():
                 candidates.append(device)
-            elif not self.name_hint and ("micro:bit" in name.lower() or "microbit" in name.lower()):
+                continue
+
+            if SERVICE_UUID.lower() in service_uuids:
+                print(f"[ble] matched advertised HyperBit service on {device.address}")
                 candidates.append(device)
+                continue
+
+            if not self.name_hint and ("micro:bit" in name.lower() or "microbit" in name.lower()):
+                candidates.append(device)
+
         if not candidates:
-            raise RuntimeError("No advertising micro:bit found.")
-        return candidates[0]
+            print("[ble] no HyperBit candidate matched. Devices seen by Windows:")
+            if not seen:
+                print("  (none)")
+            for name, address, service_uuids in seen[:40]:
+                services = ", ".join(service_uuids) if service_uuids else "<no advertised services>"
+                print(f"  {name}  {address}  services={services}")
+            raise RuntimeError(
+                "No advertising HyperBit/micro:bit found. If the board appears in the list above but does not advertise the HyperBit service, the firmware advertising needs fixing."
+            )
+
+        device = candidates[0]
+        print(f"[ble] selected {device.name or 'micro:bit'} ({device.address})")
+        return device
 
     async def connect(self):
         dev = await self._find()
@@ -68,10 +94,10 @@ class HyperBitBLE:
         await self.client.connect()
         svc = self.client.services.get_service(SERVICE_UUID)
         if svc is None:
-            print("[ble] services present:")
+            print("[ble] services present on connected device:")
             for s in self.client.services:
                 print(" ", s.uuid)
-            raise RuntimeError("HyperBit BLE service is missing; flash the CODAL firmware.")
+            raise RuntimeError("HyperBit BLE service is missing; the board was found, but this firmware does not expose the expected service.")
         self.mic_char = svc.get_characteristic(MIC_UUID)
         self.speaker_char = svc.get_characteristic(SPEAKER_UUID)
         self.control_char = svc.get_characteristic(CONTROL_UUID)
