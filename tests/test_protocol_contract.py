@@ -36,6 +36,7 @@ class ProtocolContractTests(unittest.TestCase):
             ("HYPERBIT_CAP_CONNECTION_ISOLATION", "CAP_CONNECTION_ISOLATION"),
             ("HYPERBIT_CAP_SAFE_RAINBOW_PWM", "CAP_SAFE_RAINBOW_PWM"),
             ("HYPERBIT_CAP_SEGMENTED_TTS", "CAP_SEGMENTED_TTS"),
+            ("HYPERBIT_CAP_BUFFERED_HVN", "CAP_BUFFERED_HVN"),
         ]
         for firmware_name, pc_name in pairs:
             with self.subTest(firmware=firmware_name, pc=pc_name):
@@ -67,6 +68,36 @@ class ProtocolContractTests(unittest.TestCase):
         ready_window = MAIN[ready:resume]
         self.assertIn("HYPERBIT_FIRMWARE_REVISION", ready_window)
         self.assertIn("HYPERBIT_CAPABILITIES", ready_window)
+
+    def test_critical_controls_use_bounded_notification_backpressure(self):
+        helper_start = MAIN.index("static bool sendCriticalControl")
+        helper_end = MAIN.index("static void drainMicPackets", helper_start)
+        helper = MAIN[helper_start:helper_end]
+        self.assertIn("MAX_TRIES = 250", helper)
+        self.assertIn("uBit.sleep(2)", helper)
+        self.assertIn("disconnectCurrentConnection(ble)", helper)
+
+        for event in (
+            "HB_EVT_PTT_START",
+            "HB_EVT_PTT_END",
+            "HB_EVT_TTS_SEGMENT_DONE",
+            "HB_EVT_CANCEL",
+            "HB_EVT_REPLAY",
+            "HB_EVT_MUTE_CHANGED",
+        ):
+            with self.subTest(event=event):
+                self.assertIn(f"sendCriticalControl(voice, {event}", MAIN)
+
+        # The PC must learn the utterance boundary before capture can produce its
+        # first audio packet, and release must be sent only after final drain.
+        ptt_start = MAIN.index("sendCriticalControl(voice, HB_EVT_PTT_START)")
+        mic_activate = MAIN.index("uBit.audio.activateMic();", ptt_start)
+        self.assertLess(ptt_start, mic_activate)
+
+        finish_start = MAIN.index("static bool finishMicUtterance")
+        finish_end = MAIN.index("static uint8_t visualStateFromPc", finish_start)
+        finish = MAIN[finish_start:finish_end]
+        self.assertLess(finish.index("drainMicPackets"), finish.index("HB_EVT_PTT_END"))
 
     def test_rainbow_driver_never_masks_interrupts(self):
         forbidden = ("__disable_irq", "target_disable_irq", "target_enable_irq")
