@@ -54,7 +54,7 @@ Windows raw BLE link
     -> PC validates firmware
 ```
 
-The current hardened firmware is protocol **v2**, revision **r3**.
+The current hardened firmware is protocol **v2**, revision **r4**. The PC requires the r4 buffered-HVN capability, so a stale r3 HEX is rejected explicitly.
 
 While that handshake is in progress, the micro:bit 5×5 display is deliberately **black**: firmware disables the matrix refresh driver and performs no fluid animation, accelerometer reads, Wukong updates, microphone work, speaker work, or button handling. Normal visuals resume only after READY has successfully been queued.
 
@@ -65,8 +65,11 @@ If Windows leaves a half-open raw connection, firmware evicts it after about 45 
 Audio is 8 kHz mono IMA ADPCM.
 
 - Microphone: streamed while the gold logo is held through a 512-byte ring buffer and <=20-byte BLE frames.
+- Firmware r4: a reviewed build-time CODAL override configures a 12-entry SoftDevice GATTS notification queue before BLE is enabled.
 - TTS: continuous ADPCM stream split into acknowledged <=512-byte segments, then <=20-byte BLE frames.
 - The PC checks mic sequence numbers and warns if a packet gap/overflow makes an utterance incomplete.
+
+At 4 bits per 8 kHz sample, the microphone produces about 4,000 ADPCM bytes/s. With 17 audio bytes per protocol-v2 notification that is roughly 236 notifications/s, which is why the one-entry Nordic default queue was replaced instead of relying on retry timing alone.
 
 There is no old fixed four-second whole-utterance firmware buffer anymore.
 
@@ -96,10 +99,18 @@ BLE-only manual test:
 py -3 HyperBit.py --ble-test
 ```
 
+## Building firmware locally
+
+`BUILD_FIRMWARE.bat` now mirrors the release build instead of simply reusing whatever CODAL tree happens to exist. It resets the sample checkout, removes generated build/dependency trees, CMake-configures the locked CODAL revision, applies `firmware/apply_codal_overrides.py`, then compiles.
+
+The override pins the reviewed CODAL commit and moves both the application RAM boundary and the 16-byte NOINIT region out of the expanded SoftDevice reservation. It refuses to patch an unexpected upstream revision or source anchor.
+
 ## Release verification
 
-The automatic release pipeline must pass syntax checking, protocol/BLE regression tests, Bandit static analysis, pip-audit, ClamAV source/package scans, CODAL/GNU Arm compilation, full firmware source-tree provenance comparison, open-link BLE security verification, a guard against IRQ-masking Rainbow code, and linked-ELF heap-capacity extraction.
+The automatic release pipeline must pass syntax checking, protocol/BLE/transport regression tests, Bandit static analysis, pip-audit, ClamAV source/package scans, exact source injection, locked-CODAL verification, a verified 12-entry GATTS notification queue, reserved RAM/NOINIT boundary checks, open-link BLE security verification, a guard against IRQ-masking Rainbow code, CODAL/GNU Arm compilation, final-ELF application-boundary verification, and a minimum 64 KiB calculated heap capacity.
 
-Each release includes `BUILD_PROVENANCE.txt`, checksums, test output, and security reports. Automated gates reduce risk but cannot prove the absence of every possible defect.
+Each release includes `BUILD_PROVENANCE.txt`, checksums, test output, and security reports. The provenance records the exact queue/RAM configuration and patched CODAL hashes in addition to source and firmware identity.
+
+Automated gates reduce risk but cannot prove the absence of every possible defect; the release still needs real-device BLE/audio testing.
 
 See `INSTRUCTIONS.md` for the recommended test order and `PROTOCOL.md` for the wire protocol.
