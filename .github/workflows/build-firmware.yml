@@ -1,31 +1,47 @@
-name: Build HyperBit
+name: Build, Scan & Release HyperBit
 
 on:
   push:
     branches: [main]
     paths:
       - "firmware/**"
+      - "pc_agent/**"
+      - "HyperBit.py"
+      - "HI.md"
+      - "INSTRUCTIONS.md"
+      - "INFO.md"
+      - "config.example.cmd"
+      - "FLASH_FIRMWARE.bat"
+      - "FLASH_FIRMWARE.ps1"
       - ".github/workflows/build-firmware.yml"
   pull_request:
     branches: [main]
     paths:
       - "firmware/**"
+      - "pc_agent/**"
+      - "HyperBit.py"
+      - "HI.md"
+      - "INSTRUCTIONS.md"
+      - "INFO.md"
+      - "config.example.cmd"
+      - "FLASH_FIRMWARE.bat"
+      - "FLASH_FIRMWARE.ps1"
       - ".github/workflows/build-firmware.yml"
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  build:
-    name: Compile micro:bit V2 firmware
+  build-scan-release:
+    name: Compile, scan, package and release
     runs-on: ubuntu-22.04
 
     steps:
       - name: Checkout HyperBit
         uses: actions/checkout@v4
 
-      - name: Install ARM/CODAL build tools
+      - name: Install ARM/CODAL and security tools
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -37,7 +53,44 @@ jobs:
             python3 \
             python3-pip \
             rsync \
-            zip
+            zip \
+            clamav \
+            clamav-freshclam
+
+          python3 -m pip install --upgrade pip
+          python3 -m pip install bandit pip-audit
+
+      - name: Update ClamAV signatures
+        run: |
+          sudo systemctl stop clamav-freshclam 2>/dev/null || true
+          sudo freshclam
+
+      - name: Python syntax check
+        run: |
+          python3 -m compileall -q HyperBit.py pc_agent
+
+      - name: Bandit static analysis
+        run: |
+          mkdir -p dist
+          bandit -r pc_agent -ll -ii -f txt -o dist/security-bandit.txt
+          bandit HyperBit.py -ll -ii -f txt -o dist/security-bandit-launcher.txt
+
+      - name: Python dependency vulnerability audit
+        run: |
+          pip-audit -r pc_agent/requirements.txt -f json -o dist/security-pip-audit.json
+
+      - name: ClamAV source scan
+        shell: bash
+        run: |
+          set -o pipefail
+          clamscan --infected \
+            HyperBit.py \
+            pc_agent \
+            firmware \
+            HI.md \
+            INSTRUCTIONS.md \
+            INFO.md \
+            | tee dist/security-clamav-source.txt
 
       - name: Clone official micro:bit V2 CODAL samples
         run: |
@@ -55,34 +108,126 @@ jobs:
         working-directory: .build/microbit-v2-samples
         run: python3 build.py
 
-      - name: Prepare downloadable package
+      - name: Build release ZIP
+        shell: bash
         run: |
+          set -euo pipefail
           test -f .build/microbit-v2-samples/MICROBIT.hex
-          cp .build/microbit-v2-samples/MICROBIT.hex firmware/HyperBit.hex
 
-          mkdir -p dist/package
-          cp firmware/HyperBit.hex dist/HyperBit.hex
+          rm -rf dist/release
+          mkdir -p dist/release/pc_agent
 
-          rsync -a ./ dist/package/ \
-            --exclude '.git/' \
-            --exclude '.build/' \
-            --exclude 'dist/' \
-            --exclude '.venv/' \
-            --exclude '__pycache__/' \
-            --exclude 'config.cmd'
+          cp .build/microbit-v2-samples/MICROBIT.hex dist/HyperBit.hex
+          cp dist/HyperBit.hex dist/release/HyperBit.hex
 
-          (cd dist/package && zip -qr ../HyperBit-Windows-PC.zip .)
+          cp HyperBit.py dist/release/HyperBit.py
+          cp HI.md dist/release/HI.md
+          cp INSTRUCTIONS.md dist/release/INSTRUCTIONS.md
+          cp INFO.md dist/release/INFO.md
+          cp config.example.cmd dist/release/config.example.cmd
+          cp FLASH_FIRMWARE.bat dist/release/FLASH_FIRMWARE.bat
+          cp FLASH_FIRMWARE.ps1 dist/release/FLASH_FIRMWARE.ps1
 
-          echo "### HyperBit build complete" >> "$GITHUB_STEP_SUMMARY"
-          echo "- \`HyperBit.hex\`: flash directly to a micro:bit V2" >> "$GITHUB_STEP_SUMMARY"
-          echo "- \`HyperBit-Windows-PC.zip\`: complete Windows package with the compiled HEX included" >> "$GITHUB_STEP_SUMMARY"
+          cp pc_agent/*.py dist/release/pc_agent/
+          cp pc_agent/requirements.txt dist/release/requirements.txt
 
-      - name: Upload firmware + complete Windows package
+          cat > dist/release/SECURITY_SCAN.md <<EOF
+          # HyperBit Release Verification
+
+          This release is produced only after the GitHub Actions pipeline successfully completes all configured gates:
+
+          - Python bytecode/syntax compilation check.
+          - Bandit static analysis for medium-or-higher severity findings with medium-or-higher confidence.
+          - `pip-audit` dependency vulnerability audit.
+          - ClamAV scan of the HyperBit Python and firmware source.
+          - Successful CODAL/GNU Arm compilation of the micro:bit V2 firmware.
+          - ClamAV scan of the final release ZIP before publication.
+
+          Release build: ${GITHUB_RUN_NUMBER}
+          Commit: ${GITHUB_SHA}
+
+          Automated scanning substantially improves release hygiene, but no automated scanner can prove the absence of every possible defect or unsafe behavior.
+          EOF
+
+          (cd dist/release && zip -qr ../HyperBit-release.zip .)
+
+      - name: ClamAV final package scan
+        shell: bash
+        run: |
+          set -o pipefail
+          clamscan --infected dist/HyperBit.hex dist/HyperBit-release.zip \
+            | tee dist/security-clamav-package.txt
+
+      - name: Generate SHA-256 checksums
+        run: |
+          cd dist
+          sha256sum HyperBit.hex HyperBit-release.zip > CHECKSUMS.sha256
+
+      - name: Prepare release notes
+        shell: bash
+        run: |
+          cat > dist/RELEASE_NOTES.md <<EOF
+          # HyperBit automated build ${GITHUB_RUN_NUMBER}
+
+          Built from commit `${GITHUB_SHA}`.
+
+          ## Downloads
+
+          - **HyperBit-release.zip** — recommended package. Contains the compiled firmware, `HyperBit.py`, supporting Python modules, requirements/config, `HI.md`, `INSTRUCTIONS.md`, `INFO.md`, flashing helpers, and the release verification note.
+          - **HyperBit.hex** — firmware only for a BBC micro:bit V2.
+          - **CHECKSUMS.sha256** — SHA-256 checksums for the firmware and ZIP.
+
+          ## Release gates
+
+          This release was published only after Python syntax checks, Bandit static analysis, dependency auditing, ClamAV source/package scans, and the micro:bit V2 firmware build completed successfully.
+          EOF
+
+      - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: HyperBit-build
+          name: HyperBit-build-${{ github.run_number }}
           if-no-files-found: error
           retention-days: 30
           path: |
             dist/HyperBit.hex
-            dist/HyperBit-Windows-PC.zip
+            dist/HyperBit-release.zip
+            dist/CHECKSUMS.sha256
+            dist/SECURITY*.txt
+            dist/security-*.txt
+            dist/security-*.json
+
+      - name: Create automatic GitHub Release
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          TAG="build-${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" \
+            dist/HyperBit-release.zip \
+            dist/HyperBit.hex \
+            dist/CHECKSUMS.sha256 \
+            dist/security-bandit.txt \
+            dist/security-bandit-launcher.txt \
+            dist/security-pip-audit.json \
+            dist/security-clamav-source.txt \
+            dist/security-clamav-package.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "HyperBit Build ${GITHUB_RUN_NUMBER}" \
+            --notes-file dist/RELEASE_NOTES.md \
+            --latest
+
+      - name: Build summary
+        run: |
+          echo "### HyperBit build ${GITHUB_RUN_NUMBER}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Firmware compiled: ✅" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Python syntax check: ✅" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Bandit static analysis: ✅" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Dependency audit: ✅" >> "$GITHUB_STEP_SUMMARY"
+          echo "- ClamAV source scan: ✅" >> "$GITHUB_STEP_SUMMARY"
+          echo "- ClamAV release scan: ✅" >> "$GITHUB_STEP_SUMMARY"
+          echo "- SHA-256 checksums generated: ✅" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "- GitHub Release: ✅ build-${GITHUB_RUN_NUMBER}" >> "$GITHUB_STEP_SUMMARY"
+          fi
