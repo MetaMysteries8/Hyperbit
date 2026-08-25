@@ -10,7 +10,9 @@ on:
       - "HI.md"
       - "INSTRUCTIONS.md"
       - "INFO.md"
+      - "PROTOCOL.md"
       - "config.example.cmd"
+      - "RUN_HYPERBIT.bat"
       - "FLASH_FIRMWARE.bat"
       - "FLASH_FIRMWARE.ps1"
       - ".github/workflows/build-firmware.yml"
@@ -23,7 +25,9 @@ on:
       - "HI.md"
       - "INSTRUCTIONS.md"
       - "INFO.md"
+      - "PROTOCOL.md"
       - "config.example.cmd"
+      - "RUN_HYPERBIT.bat"
       - "FLASH_FIRMWARE.bat"
       - "FLASH_FIRMWARE.ps1"
       - ".github/workflows/build-firmware.yml"
@@ -83,14 +87,10 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          clamscan --infected \
-            HyperBit.py \
-            pc_agent \
-            firmware \
-            HI.md \
-            INSTRUCTIONS.md \
-            INFO.md \
-            | tee dist/security-clamav-source.txt
+          clamscan --recursive --infected \
+            --exclude-dir='^\.git$' \
+            --exclude-dir='^dist$' \
+            . | tee dist/security-clamav-source.txt
 
       - name: Clone official micro:bit V2 CODAL samples
         run: |
@@ -124,7 +124,9 @@ jobs:
           cp HI.md dist/release/HI.md
           cp INSTRUCTIONS.md dist/release/INSTRUCTIONS.md
           cp INFO.md dist/release/INFO.md
+          cp PROTOCOL.md dist/release/PROTOCOL.md
           cp config.example.cmd dist/release/config.example.cmd
+          cp RUN_HYPERBIT.bat dist/release/RUN_HYPERBIT.bat
           cp FLASH_FIRMWARE.bat dist/release/FLASH_FIRMWARE.bat
           cp FLASH_FIRMWARE.ps1 dist/release/FLASH_FIRMWARE.ps1
 
@@ -139,9 +141,9 @@ jobs:
           - Python bytecode/syntax compilation check.
           - Bandit static analysis for medium-or-higher severity findings with medium-or-higher confidence.
           - pip-audit dependency vulnerability audit.
-          - ClamAV scan of the HyperBit Python and firmware source.
+          - ClamAV recursive scan of the checked-out HyperBit source/package scripts.
           - Successful CODAL/GNU Arm compilation of the micro:bit V2 firmware.
-          - ClamAV scan of the final release ZIP before publication.
+          - ClamAV scan of the final release ZIP and HEX before publication.
 
           Release build: ${GITHUB_RUN_NUMBER}
           Commit: ${GITHUB_SHA}
@@ -173,9 +175,17 @@ jobs:
 
           ## Downloads
 
-          - **HyperBit-release.zip** — recommended package. Contains the compiled firmware, HyperBit.py, supporting Python modules, requirements/config, HI.md, INSTRUCTIONS.md, INFO.md, flashing helpers, and the release verification note.
+          - **HyperBit-release.zip** — recommended package. Contains compiled firmware, the one-click Windows launcher, Python agent, docs, config template, and flashing helpers.
           - **HyperBit.hex** — firmware only for a BBC micro:bit V2.
           - **CHECKSUMS.sha256** — SHA-256 checksums for the firmware and ZIP.
+
+          ## Hardware controls
+
+          - Gold logo: hold to talk; microphone is physically enabled only while held.
+          - A: cancel/interrupt.
+          - B: replay last answer.
+          - A+B: mute/unmute.
+          - Wukong base + Rainbow LEDs: physical agent-state display.
 
           ## Release gates
 
