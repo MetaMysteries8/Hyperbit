@@ -6,6 +6,7 @@ on:
     paths:
       - "firmware/**"
       - "pc_agent/**"
+      - "tests/**"
       - "HyperBit.py"
       - "HI.md"
       - "INSTRUCTIONS.md"
@@ -13,6 +14,7 @@ on:
       - "PROTOCOL.md"
       - "config.example.cmd"
       - "RUN_HYPERBIT.bat"
+      - "TEST_BLE.bat"
       - "FLASH_FIRMWARE.bat"
       - "FLASH_FIRMWARE.ps1"
       - ".github/workflows/build-firmware.yml"
@@ -21,6 +23,7 @@ on:
     paths:
       - "firmware/**"
       - "pc_agent/**"
+      - "tests/**"
       - "HyperBit.py"
       - "HI.md"
       - "INSTRUCTIONS.md"
@@ -28,6 +31,7 @@ on:
       - "PROTOCOL.md"
       - "config.example.cmd"
       - "RUN_HYPERBIT.bat"
+      - "TEST_BLE.bat"
       - "FLASH_FIRMWARE.bat"
       - "FLASH_FIRMWARE.ps1"
       - ".github/workflows/build-firmware.yml"
@@ -44,7 +48,7 @@ permissions:
 
 jobs:
   build-scan-release:
-    name: Compile, scan, package and release
+    name: Compile, test, scan, package and release
     runs-on: ubuntu-22.04
 
     steps:
@@ -77,7 +81,14 @@ jobs:
 
       - name: Python syntax check
         run: |
-          python3 -m compileall -q HyperBit.py pc_agent
+          python3 -m compileall -q HyperBit.py pc_agent tests
+
+      - name: Protocol and BLE regression tests
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p dist
+          python3 -m unittest discover -s tests -v 2>&1 | tee dist/unit-tests.txt
 
       - name: Bandit static analysis
         run: |
@@ -129,11 +140,19 @@ jobs:
           cmp firmware/codal.json .build/microbit-v2-samples/codal.json
 
           # The nRF5 SDK has a macro path that can otherwise redefine OPEN_LINK
-          # security to MITM. This warning is now a release-blocking error.
+          # security to MITM. This warning is a release-blocking error.
           if grep -Fq '"MICROBIT_BLE_SECURITY_MODE" redefined' dist/firmware-build.log; then
             echo "ERROR: BLE security mode was redefined during compilation." >&2
             exit 1
           fi
+
+          # The live Rainbow driver must stay on CODAL's hardware PWM path. Any
+          # return of IRQ-masking NeoPixel code is a BLE-regression release block.
+          if grep -Eq '__disable_irq|target_disable_irq|target_enable_irq' firmware/source/WukongRainbow.*; then
+            echo "ERROR: Wukong Rainbow driver masks interrupts." >&2
+            exit 1
+          fi
+          grep -Fq 'neopixel_send_buffer' firmware/source/WukongRainbow.cpp
 
           ELF=.build/microbit-v2-samples/build/MICROBIT
           test -f "$ELF"
@@ -157,12 +176,19 @@ jobs:
             exit 1
           fi
 
+          PROTOCOL_VERSION="$(awk '$1 == "#define" && $2 == "HYPERBIT_PROTOCOL_VERSION" {print $3}' firmware/source/VoiceBLEService.h)"
+          FIRMWARE_REVISION="$(awk '$1 == "#define" && $2 == "HYPERBIT_FIRMWARE_REVISION" {print $3}' firmware/source/VoiceBLEService.h)"
+          test -n "$PROTOCOL_VERSION"
+          test -n "$FIRMWARE_REVISION"
+
           CODAL_COMMIT="$(git -C .build/microbit-v2-samples/libraries/codal-microbit-v2 rev-parse HEAD)"
           FIRMWARE_TREE_SHA="$(find firmware/source -maxdepth 1 -type f -printf '%f\0' | sort -z | while IFS= read -r -d '' f; do sha256sum "firmware/source/$f"; done | sha256sum | awk '{print $1}')"
           {
             echo "HyperBit build provenance"
             echo "github_commit=${GITHUB_SHA}"
             echo "github_run=${GITHUB_RUN_NUMBER}"
+            echo "hyperbit_protocol_version=${PROTOCOL_VERSION}"
+            echo "hyperbit_firmware_revision=${FIRMWARE_REVISION}"
             echo "codal_commit=${CODAL_COMMIT}"
             echo "codal_requested_branch=$(python3 -c 'import json; print(json.load(open("firmware/codal.json"))["target"]["branch"])')"
             echo "firmware_source_tree_sha256=${FIRMWARE_TREE_SHA}"
@@ -170,6 +196,7 @@ jobs:
             echo "voice_cpp_sha256=$(sha256sum firmware/source/VoiceBLEService.cpp | awk '{print $1}')"
             echo "voice_h_sha256=$(sha256sum firmware/source/VoiceBLEService.h | awk '{print $1}')"
             echo "mic_recorder_h_sha256=$(sha256sum firmware/source/MicRecorder.h | awk '{print $1}')"
+            echo "rainbow_cpp_sha256=$(sha256sum firmware/source/WukongRainbow.cpp | awk '{print $1}')"
             echo "codal_json_sha256=$(sha256sum firmware/codal.json | awk '{print $1}')"
             echo "pc_ble_link_sha256=$(sha256sum pc_agent/ble_link.py | awk '{print $1}')"
             echo "static_ram_end=0x${END_HEX}"
@@ -202,6 +229,7 @@ jobs:
           cp PROTOCOL.md dist/release/PROTOCOL.md
           cp config.example.cmd dist/release/config.example.cmd
           cp RUN_HYPERBIT.bat dist/release/RUN_HYPERBIT.bat
+          cp TEST_BLE.bat dist/release/TEST_BLE.bat
           cp FLASH_FIRMWARE.bat dist/release/FLASH_FIRMWARE.bat
           cp FLASH_FIRMWARE.ps1 dist/release/FLASH_FIRMWARE.ps1
           cp dist/BUILD_PROVENANCE.txt dist/release/BUILD_PROVENANCE.txt
@@ -215,19 +243,21 @@ jobs:
           This release is produced only after the GitHub Actions pipeline successfully completes all configured gates:
 
           - Python bytecode/syntax compilation check.
+          - Protocol/BLE regression unit tests.
           - Bandit static analysis for medium-or-higher severity findings with medium-or-higher confidence.
           - pip-audit dependency vulnerability audit.
           - ClamAV recursive scan of the checked-out HyperBit source/package scripts.
           - Successful CODAL/GNU Arm compilation of the micro:bit V2 firmware.
           - Verification that the entire injected firmware source tree byte-matches this commit.
           - Verification that BLE security mode was not redefined during compilation.
+          - Verification that the Rainbow driver uses the non-IRQ-masking hardware path.
           - Extraction of actual CODAL heap capacity from the linked ELF.
           - ClamAV scan of the final release ZIP and HEX before publication.
 
           Release build: ${GITHUB_RUN_NUMBER}
           Commit: ${GITHUB_SHA}
 
-          Automated scanning substantially improves release hygiene, but no automated scanner can prove the absence of every possible defect or unsafe behavior.
+          Automated scanning and regression tests substantially improve release hygiene, but no automated check can prove the absence of every possible defect or unsafe behavior.
           EOF
 
           (cd dist/release && zip -qr ../HyperBit-release.zip .)
@@ -254,10 +284,14 @@ jobs:
 
           ## Downloads
 
-          - **HyperBit-release.zip** — recommended package. Contains compiled firmware, the one-click Windows launcher, Python agent, docs, config template, flashing helpers, and build provenance.
+          - **HyperBit-release.zip** — recommended package. Contains compiled firmware, Windows launchers, Python agent, docs, config template, BLE diagnostic helper, flashing helpers, and build provenance.
           - **HyperBit.hex** — firmware only for a BBC micro:bit V2.
-          - **BUILD_PROVENANCE.txt** — exact commit/source-tree hashes/CODAL commit and real heap-capacity measurement used by the firmware build.
+          - **BUILD_PROVENANCE.txt** — exact commit/source-tree hashes/CODAL commit, firmware revision, and real heap-capacity measurement used by the firmware build.
           - **CHECKSUMS.sha256** — SHA-256 checksums for the firmware and ZIP.
+
+          ## Diagnostics
+
+          Run **TEST_BLE.bat** to validate only Bluetooth/NUS/firmware identity without a Hyper API key, STT, model call, or TTS.
 
           ## Hardware controls
 
@@ -265,11 +299,11 @@ jobs:
           - A: cancel/interrupt.
           - B: replay last answer.
           - A+B: mute/unmute.
-          - Wukong base + Rainbow LEDs: physical agent-state display.
+          - Wukong base + hardware-PWM Rainbow LEDs: physical agent-state display.
 
           ## Release gates
 
-          This release was published only after Python syntax checks, Bandit static analysis, dependency auditing, ClamAV source/package scans, full source-tree provenance checks, BLE security-config verification, real heap-capacity extraction, and the micro:bit V2 firmware build completed successfully.
+          This release was published only after syntax checks, protocol/BLE regression tests, Bandit static analysis, dependency auditing, ClamAV source/package scans, full source-tree provenance checks, BLE security-config verification, safe Rainbow-driver verification, real heap-capacity extraction, and the micro:bit V2 firmware build completed successfully.
           EOF
 
       - name: Upload workflow artifact
@@ -284,6 +318,7 @@ jobs:
             dist/CHECKSUMS.sha256
             dist/BUILD_PROVENANCE.txt
             dist/firmware-build.log
+            dist/unit-tests.txt
             dist/release/SECURITY_SCAN.md
             dist/security-*.txt
             dist/security-*.json
@@ -300,6 +335,7 @@ jobs:
             dist/HyperBit.hex \
             dist/CHECKSUMS.sha256 \
             dist/BUILD_PROVENANCE.txt \
+            dist/unit-tests.txt \
             dist/security-bandit.txt \
             dist/security-bandit-launcher.txt \
             dist/security-pip-audit.json \
@@ -316,11 +352,13 @@ jobs:
           echo "### HyperBit build ${GITHUB_RUN_NUMBER}" >> "$GITHUB_STEP_SUMMARY"
           echo "- Firmware compiled: ✅" >> "$GITHUB_STEP_SUMMARY"
           echo "- Python syntax check: ✅" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Protocol/BLE regression tests: ✅" >> "$GITHUB_STEP_SUMMARY"
           echo "- Bandit static analysis: ✅" >> "$GITHUB_STEP_SUMMARY"
           echo "- Dependency audit: ✅" >> "$GITHUB_STEP_SUMMARY"
           echo "- ClamAV source scan: ✅" >> "$GITHUB_STEP_SUMMARY"
           echo "- Full firmware source-tree provenance verified: ✅" >> "$GITHUB_STEP_SUMMARY"
           echo "- BLE security macro conflict absent: ✅" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Safe hardware-PWM Rainbow path verified: ✅" >> "$GITHUB_STEP_SUMMARY"
           echo "- Real CODAL heap capacity extracted: ✅" >> "$GITHUB_STEP_SUMMARY"
           echo "- ClamAV release scan: ✅" >> "$GITHUB_STEP_SUMMARY"
           echo "- SHA-256 checksums generated: ✅" >> "$GITHUB_STEP_SUMMARY"
