@@ -55,6 +55,15 @@ public:
     bool sendControl(uint8_t code, uint8_t a=0, uint8_t b=0, uint8_t c=0);
     bool sendMic(uint8_t seq, const uint8_t *data, int len);
 
+    // A raw BLE connection is not enough: Windows must finish discovering the
+    // service and subscribe to both notification characteristics. This is used
+    // by the firmware to detect and evict half-open WinRT/GATT sessions.
+    bool notificationsReady() {
+        return getConnected() &&
+               notifyChrValueEnabled(HB_MIC) &&
+               notifyChrValueEnabled(HB_CONTROL);
+    }
+
     bool ttsReady() const { return ttsReadyFlag; }
     void clearTtsReady() { ttsReadyFlag = false; }
     void abortTts();
