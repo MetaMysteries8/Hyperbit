@@ -73,6 +73,39 @@ static bool playTtsInterruptible(
     return !uBit.buttonA.isPressed();
 }
 
+static void disconnectCurrentConnection(VoiceBLEService &voice) {
+    microbit_gaphandle_t handle = voice.getConnectionHandle();
+    if (handle != BLE_CONN_HANDLE_INVALID) {
+        (void)sd_ble_gap_disconnect(handle, BLE_HCI_REMOTE_USER_TERMINATED_CONNECTION);
+    }
+}
+
+// Critical device->PC controls share the same SoftDevice notification queue as
+// microphone audio. A full queue is normal backpressure, not a reason to lose
+// an event. Give radio events up to ~500 ms to drain; if the queue never makes
+// progress, tear down the session so the PC's reconnect path can recover rather
+// than leaving both sides waiting forever for a control notification that died.
+static bool sendCriticalControl(
+    VoiceBLEService &ble,
+    uint8_t code,
+    uint8_t a = 0,
+    uint8_t b = 0,
+    uint8_t c = 0
+) {
+    const int MAX_TRIES = 250;
+    int tries = 0;
+
+    while (ble.getConnected() && ble.notificationsReady() && tries < MAX_TRIES) {
+        if (ble.sendControl(code, a, b, c))
+            return true;
+        uBit.sleep(2);
+        ++tries;
+    }
+
+    disconnectCurrentConnection(ble);
+    return false;
+}
+
 static void drainMicPackets(
     VoiceBLEService &ble,
     MicRecorder &rec,
@@ -100,7 +133,7 @@ static void drainMicPackets(
     }
 }
 
-static void finishMicUtterance(VoiceBLEService &ble, MicRecorder &rec, uint8_t &sequence) {
+static bool finishMicUtterance(VoiceBLEService &ble, MicRecorder &rec, uint8_t &sequence) {
     rec.stop();
     uBit.audio.deactivateMic();
     drainMicPackets(ble, rec, sequence, true);
@@ -112,7 +145,9 @@ static void finishMicUtterance(VoiceBLEService &ble, MicRecorder &rec, uint8_t &
     if (rec.overflowed())
         high |= 0x80;
 
-    ble.sendControl(HB_EVT_PTT_END, low, mid, high);
+    // This event terminates the PC's ADPCM utterance. It must be queued after
+    // all preceding mic notifications or the PC can wait forever for release.
+    return sendCriticalControl(ble, HB_EVT_PTT_END, low, mid, high);
 }
 
 static uint8_t visualStateFromPc(uint8_t pcState) {
@@ -132,13 +167,6 @@ static bool stateIsBusyForPtt(uint8_t state) {
            state == PHYS_TRANSCRIBING ||
            state == PHYS_THINKING ||
            state == PHYS_SPEAKING;
-}
-
-static void kickHalfOpenConnection(VoiceBLEService &voice) {
-    microbit_gaphandle_t handle = voice.getConnectionHandle();
-    if (handle != BLE_CONN_HANDLE_INVALID) {
-        (void)sd_ble_gap_disconnect(handle, BLE_HCI_REMOTE_USER_TERMINATED_CONNECTION);
-    }
 }
 
 static void suspendDisplayForConnection(bool &displaySuspended) {
@@ -255,7 +283,7 @@ int main() {
 
         if (rawConnected && !applicationReady) {
             if (++halfOpenTicks >= HALF_OPEN_LIMIT_TICKS) {
-                kickHalfOpenConnection(voice);
+                disconnectCurrentConnection(voice);
                 halfOpenTicks = 0;
                 uBit.sleep(10);
                 continue;
@@ -311,18 +339,28 @@ int main() {
         if (ab && !lastAB) {
             muted = !muted;
             animator.setMuted(muted);
-            voice.sendControl(HB_EVT_MUTE_CHANGED, muted ? 1 : 0);
+            if (!sendCriticalControl(voice, HB_EVT_MUTE_CHANGED, muted ? 1 : 0)) {
+                uBit.sleep(10);
+                continue;
+            }
         } else if (!ab) {
             if (a && !lastA) {
                 voice.abortTts();
-                voice.sendControl(HB_EVT_CANCEL);
+                if (!sendCriticalControl(voice, HB_EVT_CANCEL)) {
+                    uBit.sleep(10);
+                    continue;
+                }
                 interruptGraceTicks = 300;
                 animator.setState(PHYS_IDLE);
                 lastPcState = voice.pcState();
             }
 
-            if (b && !lastB)
-                voice.sendControl(HB_EVT_REPLAY);
+            if (b && !lastB) {
+                if (!sendCriticalControl(voice, HB_EVT_REPLAY)) {
+                    uBit.sleep(10);
+                    continue;
+                }
+            }
         }
 
         lastA = a;
@@ -356,10 +394,20 @@ int main() {
             }
 
             voice.clearTtsReady();
-            voice.sendControl(HB_EVT_TTS_SEGMENT_DONE, completed ? 1 : 0);
+            if (!sendCriticalControl(voice, HB_EVT_TTS_SEGMENT_DONE, completed ? 1 : 0)) {
+                speaking = false;
+                lastPcState = 255;
+                uBit.sleep(10);
+                continue;
+            }
 
             if (!completed) {
-                voice.sendControl(HB_EVT_CANCEL);
+                if (!sendCriticalControl(voice, HB_EVT_CANCEL)) {
+                    speaking = false;
+                    lastPcState = 255;
+                    uBit.sleep(10);
+                    continue;
+                }
                 interruptGraceTicks = 300;
             }
 
@@ -381,14 +429,22 @@ int main() {
         if (logo && !pttActive) {
             if (busy) {
                 interruptGraceTicks = 0;
-                voice.sendControl(HB_EVT_CANCEL);
+                if (!sendCriticalControl(voice, HB_EVT_CANCEL)) {
+                    uBit.sleep(10);
+                    continue;
+                }
             }
 
+            // Establish the utterance boundary on the PC before enabling capture,
+            // so no audio notification can precede its PTT_START marker.
             micSequence = 0;
+            if (!sendCriticalControl(voice, HB_EVT_PTT_START)) {
+                uBit.sleep(10);
+                continue;
+            }
             uBit.audio.activateMic();
             recorder.start();
             pttActive = true;
-            voice.sendControl(HB_EVT_PTT_START);
             animator.setState(PHYS_LISTENING);
         }
 
@@ -399,8 +455,12 @@ int main() {
             } else {
                 animator.setInputLevel(0);
                 animator.setState(PHYS_UPLOADING);
-                finishMicUtterance(voice, recorder, micSequence);
+                bool endedCleanly = finishMicUtterance(voice, recorder, micSequence);
                 pttActive = false;
+                if (!endedCleanly) {
+                    uBit.sleep(10);
+                    continue;
+                }
             }
         }
 
