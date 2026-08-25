@@ -10,6 +10,15 @@
 #define HYPERBIT_NUS_AUDIO_PAYLOAD 17
 #define HYPERBIT_PROTOCOL_VERSION 2
 
+// Protocol v2 stays wire-compatible while this revision identifies the minimum
+// firmware that has the connection-isolation/NUS fixes. READY reports both so
+// the PC can reject a stale HEX instead of silently debugging the wrong build.
+#define HYPERBIT_FIRMWARE_REVISION 3
+#define HYPERBIT_CAP_CONNECTION_ISOLATION 0x01
+#define HYPERBIT_CAP_SAFE_RAINBOW_PWM      0x02
+#define HYPERBIT_CAP_SEGMENTED_TTS         0x04
+#define HYPERBIT_CAPABILITIES (HYPERBIT_CAP_CONNECTION_ISOLATION | HYPERBIT_CAP_SAFE_RAINBOW_PWM | HYPERBIT_CAP_SEGMENTED_TTS)
+
 enum HyperBitCharIndex {
     HB_NUS_TX = 0,
     HB_NUS_RX = 1,
@@ -41,13 +50,13 @@ enum HyperBitCommand {
     HB_CMD_SET_STATE = 0x40
 };
 
-// HyperBit now uses the standard Nordic UART Service UUID layout:
+// HyperBit uses the standard Nordic UART Service UUID layout:
 //   service 6e400001-b5a3-f393-e0a9-e50e24dcca9e
 //   RX      6e400002-b5a3-f393-e0a9-e50e24dcca9e (PC -> device)
 //   TX      6e400003-b5a3-f393-e0a9-e50e24dcca9e (device -> PC)
 //
-// We keep the class name so the rest of the firmware can stay small, but the
-// old HyperBit-specific 7f9a... service no longer exists.
+// We keep a tiny framed protocol on top because audio needs packet boundaries
+// and notification throughput; the old HyperBit-specific 7f9a service is gone.
 class VoiceBLEService : public codal::MicroBitBLEService {
     uint8_t txValue[20];
     uint8_t rxValue[20];
@@ -63,6 +72,8 @@ class VoiceBLEService : public codal::MicroBitBLEService {
     uint8_t pcStateValue;
 
 protected:
+    virtual void onConnect(const microbit_ble_evt_t *p_ble_evt);
+    virtual void onDisconnect(const microbit_ble_evt_t *p_ble_evt);
     virtual void onDataWritten(const microbit_ble_evt_write_t *params);
 
 public:
@@ -74,10 +85,12 @@ public:
     bool sendControl(uint8_t code, uint8_t a=0, uint8_t b=0, uint8_t c=0);
     bool sendMic(uint8_t seq, const uint8_t *data, int len);
 
-    // The application session becomes ready only after the PC has subscribed to
-    // NUS TX and explicitly written a HELLO frame to NUS RX. We intentionally do
-    // not inspect CCCDs while Windows is still discovering GATT.
-    bool notificationsReady() { return getConnected() && sessionReadyFlag; }
+    // HELLO is accepted only after the PC has enabled TX notifications. Checking
+    // the CCCD here is safe because HELLO arrives after Windows GATT discovery;
+    // we intentionally never poll it during the fragile discovery window.
+    bool notificationsReady() {
+        return getConnected() && sessionReadyFlag && notifyChrValueEnabled(HB_NUS_TX);
+    }
     void resetSession();
 
     bool ttsReady() const { return ttsReadyFlag; }
