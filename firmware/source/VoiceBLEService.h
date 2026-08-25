@@ -2,13 +2,24 @@
 #include "MicroBit.h"
 #include "MicroBitBLEService.h"
 
-#define HYPERBIT_MAX_TTS_ADPCM 4096
+// Keep TTS chunks deliberately small. Build 28 left only ~2 KiB of application
+// RAM free; a 512-byte segment still gives useful buffering while returning
+// several KiB of headroom to the BLE runtime/stack.
+#define HYPERBIT_MAX_TTS_ADPCM 512
+#define HYPERBIT_NUS_AUDIO_PAYLOAD 17
+#define HYPERBIT_PROTOCOL_VERSION 2
 
 enum HyperBitCharIndex {
-    HB_MIC = 0,
-    HB_SPEAKER = 1,
-    HB_CONTROL = 2,
-    HB_CHAR_COUNT = 3
+    HB_NUS_TX = 0,
+    HB_NUS_RX = 1,
+    HB_CHAR_COUNT = 2
+};
+
+enum HyperBitFrameType {
+    HB_FRAME_CONTROL = 0xA0,
+    HB_FRAME_MIC     = 0xA1,
+    HB_FRAME_TTS     = 0xA2,
+    HB_FRAME_HELLO   = 0xA3
 };
 
 enum HyperBitEvent {
@@ -29,12 +40,19 @@ enum HyperBitCommand {
     HB_CMD_SET_STATE = 0x40
 };
 
+// HyperBit now uses the standard Nordic UART Service UUID layout:
+//   service 6e400001-b5a3-f393-e0a9-e50e24dcca9e
+//   RX      6e400002-b5a3-f393-e0a9-e50e24dcca9e (PC -> device)
+//   TX      6e400003-b5a3-f393-e0a9-e50e24dcca9e (device -> PC)
+//
+// We keep the class name so the rest of the firmware can stay small, but the
+// old HyperBit-specific 7f9a... service no longer exists.
 class VoiceBLEService : public codal::MicroBitBLEService {
-    uint8_t micValue[20];
-    uint8_t speakerValue[20];
-    uint8_t controlValue[20];
+    uint8_t txValue[20];
+    uint8_t rxValue[20];
     codal::MicroBitBLEChar chars[HB_CHAR_COUNT];
 
+    volatile bool sessionReadyFlag;
     bool ttsReceiving;
     volatile bool ttsReadyFlag;
     uint16_t ttsLen;
@@ -55,11 +73,11 @@ public:
     bool sendControl(uint8_t code, uint8_t a=0, uint8_t b=0, uint8_t c=0);
     bool sendMic(uint8_t seq, const uint8_t *data, int len);
 
-    // A raw BLE radio link is not enough to call HyperBit ready. Windows must
-    // finish GATT discovery and subscribe to both notification channels first.
-    bool notificationsReady() {
-        return getConnected() && notifyChrValueEnabled(HB_MIC) && notifyChrValueEnabled(HB_CONTROL);
-    }
+    // The application session becomes ready only after the PC has subscribed to
+    // NUS TX and explicitly written a HELLO frame to NUS RX. We intentionally do
+    // not inspect CCCDs while Windows is still discovering GATT.
+    bool notificationsReady() const { return getConnected() && sessionReadyFlag; }
+    void resetSession();
 
     bool ttsReady() const { return ttsReadyFlag; }
     void clearTtsReady() { ttsReadyFlag = false; }
