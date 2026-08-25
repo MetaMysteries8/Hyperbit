@@ -79,7 +79,7 @@ static void drainMicPackets(
     uint8_t &sequence,
     bool drainAll
 ) {
-    uint8_t packet[19];
+    uint8_t packet[HYPERBIT_NUS_AUDIO_PAYLOAD];
     int budget = drainAll ? 10000 : 8;
 
     while (budget-- > 0) {
@@ -137,8 +137,6 @@ static bool stateIsBusyForPtt(uint8_t state) {
 static void kickHalfOpenConnection(VoiceBLEService &voice) {
     microbit_gaphandle_t handle = voice.getConnectionHandle();
     if (handle != BLE_CONN_HANDLE_INVALID) {
-        // A raw Windows link can occasionally occupy the micro:bit without ever
-        // finishing GATT discovery. Evict it; CODAL then advertises again.
         (void)sd_ble_gap_disconnect(handle, BLE_HCI_REMOTE_USER_TERMINATED_CONNECTION);
     }
 }
@@ -146,18 +144,15 @@ static void kickHalfOpenConnection(VoiceBLEService &voice) {
 int main() {
     uBit.init();
 
-    // Stop advertising before touching the Wukong's bit-banged WS2812 LEDs.
-    // Their current driver briefly masks IRQs and must not run while Nordic's
-    // SoftDevice is servicing advertising/connection radio events.
+    // Never bit-bang the Wukong RGB LEDs while the SoftDevice is active.
     uBit.bleManager.stopAdvertising();
 
     VoiceBLEService voice;
     uBit.bleManager.setTransmitPower(7);
     uBit.bleManager.setAdvertiseOnDisconnect(true);
 
-    // Configure the audio graph, but DO NOT enable the PWM/speaker engine before
-    // BLE/GATT is ready. MicroBitAudio::enable() creates NRF52PWM and mixer output
-    // machinery; none of that is needed while Windows is discovering services.
+    // Configure the microphone graph, but keep both mic capture and speaker PWM
+    // inactive until an application session actually needs them.
     uBit.audio.mic->setSampleRate(8000);
     uBit.audio.setPinEnabled(false);
     uBit.audio.setSpeakerEnabled(true);
@@ -178,9 +173,6 @@ int main() {
 
     bool wukongBaseOk = baseLights.selfTest();
     rainbow.selfTest();
-    // Friendly steady blue on the four P16 RGB LEDs. Leave them at this value
-    // while BLE is running; the 8 blue I2C base LEDs remain animated outside
-    // the raw connecting diagnostic phase.
     rainbow.setAll(0, 6, 18);
     uBit.display.print(wukongBaseOk ? "H" : "W");
     uBit.sleep(350);
@@ -188,11 +180,12 @@ int main() {
     AliveAnimator animator(uBit, baseLights, rainbow);
     animator.setState(PHYS_DISCONNECTED);
 
-    // Only begin radio activity after all interrupt-masking RGB writes are done.
+    // Start BLE only after all interrupt-masking RGB writes are finished.
     uBit.bleManager.advertise();
 
     bool lastRawConnected = false;
     bool lastSessionReady = false;
+    bool displaySuspended = false;
     bool pttActive = false;
     bool lastA = false;
     bool lastB = false;
@@ -206,23 +199,38 @@ int main() {
     int interruptGraceTicks = 0;
     int animationDivider = 0;
 
-    // Bleak allows Windows up to 35 seconds to finish connect + GATT service
-    // discovery. Do not evict a raw link before that valid client window has
-    // elapsed; allow an extra ~10 seconds for timeout cleanup and radio churn.
+    // Windows may still leave a raw BLE link half-open. Give it a long window,
+    // then evict it and let CODAL advertise again.
     int halfOpenTicks = 0;
     const int HALF_OPEN_LIMIT_TICKS = 4500; // ~45 seconds at 10 ms/tick
 
     while (true) {
         bool rawConnected = voice.getConnected();
+        if (!rawConnected)
+            voice.resetSession();
         bool sessionReady = voice.notificationsReady();
 
         if (rawConnected != lastRawConnected) {
             lastRawConnected = rawConnected;
+
             if (rawConnected && !sessionReady) {
-                // Diagnostic/stability state: matrix only. No accelerometer,
-                // Wukong I2C, logo/button handling, mic, or speaker work below.
-                animator.setState(PHYS_CONNECTING);
-            } else if (!rawConnected && !sessionReady) {
+                // Connection first, personality second. Disable the LED matrix
+                // refresh hardware completely while Windows establishes the NUS
+                // session. No face animation, accelerometer or Wukong traffic.
+                if (!displaySuspended) {
+                    uBit.display.clear();
+                    uBit.display.disable();
+                    displaySuspended = true;
+                }
+            }
+
+            if (!rawConnected) {
+                if (displaySuspended) {
+                    uBit.display.enable();
+                    uBit.display.setDisplayMode(DISPLAY_MODE_GREYSCALE);
+                    uBit.display.clear();
+                    displaySuspended = false;
+                }
                 animator.setState(PHYS_DISCONNECTED);
             }
         }
@@ -233,19 +241,19 @@ int main() {
                 halfOpenTicks = 0;
             }
 
-            // Keep the raw connection phase brutally small. If this pure 5x5
-            // heartbeat also freezes, the problem is below our peripheral/audio
-            // code and points at the BLE/SoftDevice/display scheduling layer.
-            if (++animationDivider >= 3) {
-                animationDivider = 0;
-                animator.tick();
-            }
-
+            // Deliberately do nothing except service the scheduler/watchdog.
             uBit.sleep(10);
             continue;
         }
 
         halfOpenTicks = 0;
+
+        if (sessionReady && displaySuspended) {
+            uBit.display.enable();
+            uBit.display.setDisplayMode(DISPLAY_MODE_GREYSCALE);
+            uBit.display.clear();
+            displaySuspended = false;
+        }
 
         if (interruptGraceTicks > 0)
             --interruptGraceTicks;
@@ -254,7 +262,7 @@ int main() {
             lastSessionReady = sessionReady;
             if (sessionReady) {
                 animator.setState(PHYS_IDLE);
-                voice.sendControl(HB_EVT_READY);
+                voice.sendControl(HB_EVT_READY, HYPERBIT_PROTOCOL_VERSION, 0, 0);
                 voice.sendControl(HB_EVT_WUKONG_STATUS, baseLights.ok() ? 1 : 0);
             } else {
                 if (pttActive) {
@@ -285,9 +293,8 @@ int main() {
                 lastPcState = voice.pcState();
             }
 
-            if (b && !lastB) {
+            if (b && !lastB)
                 voice.sendControl(HB_EVT_REPLAY);
-            }
         }
 
         lastA = a;
@@ -300,8 +307,6 @@ int main() {
             pttActive = false;
             uBit.audio.deactivateMic();
 
-            // Lazy-start the PWM/speaker engine only when there is actual audio
-            // to play. This keeps it completely out of BLE GATT discovery.
             if (!audioOutputReady) {
                 uBit.audio.enable();
                 uBit.audio.mixer.addChannel(ttsSource, 8000, 255);
