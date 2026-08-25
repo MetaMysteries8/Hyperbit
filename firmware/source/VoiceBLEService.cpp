@@ -163,8 +163,14 @@ void VoiceBLEService::onDataWritten(const microbit_ble_evt_write_t *params) {
     }
 
     if (code == HB_CMD_TTS_END) {
+        // An earlier sequence/length fault calls abortTts(), which clears the
+        // lengths. The PC may already have queued TTS_END, so never let that
+        // stale end frame turn an aborted zero-length receive into success.
+        if (!ttsReceiving)
+            return;
+
         ttsReceiving = false;
-        if (ttsExpectedLen == 0 || ttsLen == ttsExpectedLen) {
+        if (ttsLen == ttsExpectedLen) {
             ttsReadyFlag = true;
         } else {
             abortTts();
