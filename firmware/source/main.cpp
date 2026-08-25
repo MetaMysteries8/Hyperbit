@@ -202,10 +202,11 @@ int main() {
     int interruptGraceTicks = 0;
     int animationDivider = 0;
 
-    // Main loop is ~10 ms/tick. A raw link that fails to subscribe to the two
-    // HyperBit notification characteristics within ~12 seconds is unusable.
+    // Bleak allows Windows up to 35 seconds to finish connect + GATT service
+    // discovery. Do not evict a raw link before that valid client window has
+    // elapsed; allow an extra ~10 seconds for timeout cleanup and radio churn.
     int halfOpenTicks = 0;
-    const int HALF_OPEN_LIMIT_TICKS = 1200;
+    const int HALF_OPEN_LIMIT_TICKS = 4500; // ~45 seconds at 10 ms/tick
 
     while (true) {
         bool rawConnected = voice.getConnected();
