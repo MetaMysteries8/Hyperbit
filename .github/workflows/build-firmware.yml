@@ -105,8 +105,49 @@ jobs:
           cp firmware/codal.json .build/microbit-v2-samples/codal.json
 
       - name: Compile HyperBit.hex
+        shell: bash
         working-directory: .build/microbit-v2-samples
-        run: python3 build.py
+        run: |
+          set -o pipefail
+          python3 build.py 2>&1 | tee ../../dist/firmware-build.log
+
+      - name: Verify build provenance and BLE configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Prove the compiler saw the exact source/config files checked out from
+          # this HyperBit commit rather than stale sample-project contents.
+          cmp firmware/source/main.cpp .build/microbit-v2-samples/source/main.cpp
+          cmp firmware/source/VoiceBLEService.cpp .build/microbit-v2-samples/source/VoiceBLEService.cpp
+          cmp firmware/source/VoiceBLEService.h .build/microbit-v2-samples/source/VoiceBLEService.h
+          cmp firmware/codal.json .build/microbit-v2-samples/codal.json
+
+          # The nRF5 SDK has a macro path that can otherwise redefine OPEN_LINK
+          # security to MITM. This warning is now a release-blocking error.
+          if grep -Fq '"MICROBIT_BLE_SECURITY_MODE" redefined' dist/firmware-build.log; then
+            echo "ERROR: BLE security mode was redefined during compilation." >&2
+            exit 1
+          fi
+
+          CODAL_COMMIT="$(git -C .build/microbit-v2-samples/libraries/codal-microbit-v2 rev-parse HEAD)"
+          {
+            echo "HyperBit build provenance"
+            echo "github_commit=${GITHUB_SHA}"
+            echo "github_run=${GITHUB_RUN_NUMBER}"
+            echo "codal_commit=${CODAL_COMMIT}"
+            echo "codal_requested_branch=$(python3 -c 'import json; print(json.load(open("firmware/codal.json"))["target"]["branch"])')"
+            echo "main_cpp_sha256=$(sha256sum firmware/source/main.cpp | awk '{print $1}')"
+            echo "voice_cpp_sha256=$(sha256sum firmware/source/VoiceBLEService.cpp | awk '{print $1}')"
+            echo "voice_h_sha256=$(sha256sum firmware/source/VoiceBLEService.h | awk '{print $1}')"
+            echo "codal_json_sha256=$(sha256sum firmware/codal.json | awk '{print $1}')"
+            echo "pc_ble_link_sha256=$(sha256sum pc_agent/ble_link.py | awk '{print $1}')"
+            echo
+            echo "Linker memory summary:"
+            grep -E '^[[:space:]]+(FLASH|RAM):' dist/firmware-build.log || true
+          } > dist/BUILD_PROVENANCE.txt
+
+          cat dist/BUILD_PROVENANCE.txt
 
       - name: Build release ZIP
         shell: bash
@@ -129,6 +170,7 @@ jobs:
           cp RUN_HYPERBIT.bat dist/release/RUN_HYPERBIT.bat
           cp FLASH_FIRMWARE.bat dist/release/FLASH_FIRMWARE.bat
           cp FLASH_FIRMWARE.ps1 dist/release/FLASH_FIRMWARE.ps1
+          cp dist/BUILD_PROVENANCE.txt dist/release/BUILD_PROVENANCE.txt
 
           cp pc_agent/*.py dist/release/pc_agent/
           cp pc_agent/requirements.txt dist/release/requirements.txt
@@ -143,6 +185,8 @@ jobs:
           - pip-audit dependency vulnerability audit.
           - ClamAV recursive scan of the checked-out HyperBit source/package scripts.
           - Successful CODAL/GNU Arm compilation of the micro:bit V2 firmware.
+          - Verification that the injected build files byte-match this commit.
+          - Verification that BLE security mode was not redefined during compilation.
           - ClamAV scan of the final release ZIP and HEX before publication.
 
           Release build: ${GITHUB_RUN_NUMBER}
@@ -175,8 +219,9 @@ jobs:
 
           ## Downloads
 
-          - **HyperBit-release.zip** — recommended package. Contains compiled firmware, the one-click Windows launcher, Python agent, docs, config template, and flashing helpers.
+          - **HyperBit-release.zip** — recommended package. Contains compiled firmware, the one-click Windows launcher, Python agent, docs, config template, flashing helpers, and build provenance.
           - **HyperBit.hex** — firmware only for a BBC micro:bit V2.
+          - **BUILD_PROVENANCE.txt** — exact commit/source hashes/CODAL commit used by the firmware build.
           - **CHECKSUMS.sha256** — SHA-256 checksums for the firmware and ZIP.
 
           ## Hardware controls
@@ -189,7 +234,7 @@ jobs:
 
           ## Release gates
 
-          This release was published only after Python syntax checks, Bandit static analysis, dependency auditing, ClamAV source/package scans, and the micro:bit V2 firmware build completed successfully.
+          This release was published only after Python syntax checks, Bandit static analysis, dependency auditing, ClamAV source/package scans, source-injection provenance checks, BLE security-config verification, and the micro:bit V2 firmware build completed successfully.
           EOF
 
       - name: Upload workflow artifact
@@ -202,6 +247,8 @@ jobs:
             dist/HyperBit.hex
             dist/HyperBit-release.zip
             dist/CHECKSUMS.sha256
+            dist/BUILD_PROVENANCE.txt
+            dist/firmware-build.log
             dist/release/SECURITY_SCAN.md
             dist/security-*.txt
             dist/security-*.json
@@ -217,6 +264,7 @@ jobs:
             dist/HyperBit-release.zip \
             dist/HyperBit.hex \
             dist/CHECKSUMS.sha256 \
+            dist/BUILD_PROVENANCE.txt \
             dist/security-bandit.txt \
             dist/security-bandit-launcher.txt \
             dist/security-pip-audit.json \
@@ -236,6 +284,8 @@ jobs:
           echo "- Bandit static analysis: ✅" >> "$GITHUB_STEP_SUMMARY"
           echo "- Dependency audit: ✅" >> "$GITHUB_STEP_SUMMARY"
           echo "- ClamAV source scan: ✅" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Source/build provenance verified: ✅" >> "$GITHUB_STEP_SUMMARY"
+          echo "- BLE security macro conflict absent: ✅" >> "$GITHUB_STEP_SUMMARY"
           echo "- ClamAV release scan: ✅" >> "$GITHUB_STEP_SUMMARY"
           echo "- SHA-256 checksums generated: ✅" >> "$GITHUB_STEP_SUMMARY"
           if [ "${{ github.event_name }}" != "pull_request" ]; then
