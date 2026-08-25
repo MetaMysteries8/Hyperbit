@@ -34,6 +34,13 @@ bool WukongLights::steady(uint8_t brightness) {
     return lastOk;
 }
 
+bool WukongLights::setBrightnessFast(uint8_t brightness) {
+    if (brightness > 100) brightness = 100;
+    // Once steady mode (0x11 = 160) has been selected, updating just the
+    // brightness register is enough for animation and avoids a 100 ms sleep.
+    return write4(0x12, brightness);
+}
+
 bool WukongLights::off() {
     bool a = write4(0x12, 0);
     fiber_sleep(100);
