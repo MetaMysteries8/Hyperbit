@@ -46,6 +46,12 @@ void AliveAnimator::setState(uint8_t state) {
     baseDivider = 0;
     lastBaseLevel = 255;
 
+    // The raw BLE/GATT connecting state is intentionally matrix-only. Do not
+    // touch the shared I2C bus or Wukong controller while Windows is discovering
+    // attributes; this state is also a diagnostic heartbeat for firmware stalls.
+    if (state == PHYS_CONNECTING)
+        return;
+
     if (state == PHYS_DISCONNECTED) {
         base.breath();
     } else {
@@ -107,6 +113,26 @@ void AliveAnimator::renderFluid(int ax, int ay, bool dimmer) {
         plot(x, y - 1, halo);
         plot(x, y + 1, halo);
     }
+}
+
+void AliveAnimator::renderConnecting() {
+    clearMatrix();
+
+    // Pure 5x5 heartbeat/spinner. No accelerometer reads, Wukong I2C writes,
+    // microphone/audio work, or NeoPixel traffic is involved in this frame.
+    static const uint8_t path[12][2] = {
+        {2,0},{3,0},{4,1},{4,2},{4,3},{3,4},
+        {2,4},{1,4},{0,3},{0,2},{0,1},{1,0}
+    };
+
+    int head = (frame / 2) % 12;
+    for (int trail = 0; trail < 4; ++trail) {
+        int idx = (head - trail + 12) % 12;
+        plot(path[idx][0], path[idx][1], (uint8_t)(235 - trail * 55));
+    }
+
+    uint8_t heart = ((frame / 4) & 1) ? 110 : 35;
+    plot(2, 2, heart);
 }
 
 void AliveAnimator::renderListening(uint8_t level) {
@@ -194,7 +220,7 @@ void AliveAnimator::renderError() {
 }
 
 void AliveAnimator::updateBodyGlow(uint8_t level) {
-    if (stateValue == PHYS_DISCONNECTED || !baseDynamic)
+    if (stateValue == PHYS_DISCONNECTED || stateValue == PHYS_CONNECTING || !baseDynamic)
         return;
 
     if (++baseDivider < 4)
@@ -237,6 +263,14 @@ void AliveAnimator::renderWukong(int ax, int ay, uint8_t level) {
 
 void AliveAnimator::tick() {
     ++frame;
+
+    // This path is intentionally before ANY accelerometer or Wukong access.
+    // If this animation stops during GATT discovery, the problem is below the
+    // peripheral animation layer (display scheduling / BLE SoftDevice runtime).
+    if (stateValue == PHYS_CONNECTING) {
+        renderConnecting();
+        return;
+    }
 
     int ax = bit.accelerometer.getX();
     int ay = bit.accelerometer.getY();
