@@ -77,6 +77,10 @@ class ProtocolContractTests(unittest.TestCase):
         self.assertIn("uBit.sleep(2)", helper)
         self.assertIn("disconnectCurrentConnection(ble)", helper)
 
+        # Critical controls may be emitted from main() (where the service object
+        # is named `voice`) or a helper such as finishMicUtterance() (where it is
+        # named `ble`). Verify they route through sendCriticalControl regardless
+        # of the local identifier rather than matching one spelling literally.
         for event in (
             "HB_EVT_PTT_START",
             "HB_EVT_PTT_END",
@@ -86,7 +90,10 @@ class ProtocolContractTests(unittest.TestCase):
             "HB_EVT_MUTE_CHANGED",
         ):
             with self.subTest(event=event):
-                self.assertIn(f"sendCriticalControl(voice, {event}", MAIN)
+                self.assertRegex(
+                    MAIN,
+                    rf"sendCriticalControl\([^,]+,\s*{event}(?:\s*[,\)])",
+                )
 
         # The PC must learn the utterance boundary before capture can produce its
         # first audio packet, and release must be sent only after final drain.
