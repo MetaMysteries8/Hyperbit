@@ -2,9 +2,10 @@
 #include "MicroBit.h"
 #include "MicroBitBLEService.h"
 
-// Keep TTS chunks deliberately small. Build 28 left only ~2 KiB of application
-// RAM free; a 512-byte segment still gives useful buffering while returning
-// several KiB of headroom to the BLE runtime/stack.
+// Keep TTS chunks deliberately small. CODAL's softdevice linker script expands
+// its .heap section to the RAM limit, so the generic linker RAM percentage is
+// not a free-heap measurement. A smaller segment still increases real dynamic
+// heap capacity and reduces runtime buffering pressure.
 #define HYPERBIT_MAX_TTS_ADPCM 512
 #define HYPERBIT_NUS_AUDIO_PAYLOAD 17
 #define HYPERBIT_PROTOCOL_VERSION 2
