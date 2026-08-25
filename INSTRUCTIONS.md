@@ -48,14 +48,22 @@ HyperBit uses both:
 
 The LEDs show connection and agent state such as idle, listening, uploading, thinking, speaking, muted, and error.
 
-## 5. Audio size / chunking
+## 5. BLE connection behavior
+
+HyperBit now uses the conventional **Nordic UART Service (NUS)** UUID layout instead of the older HyperBit-specific three-characteristic service.
+
+While Windows is establishing the raw BLE/NUS session, the firmware deliberately disables the micro:bit 5x5 display refresh driver and pauses animation, accelerometer reads, Wukong updates, microphone work, and speaker PWM. A briefly blank 5x5 during connection is therefore intentional; the face comes back after the HyperBit HELLO/READY handshake completes or the connection drops.
+
+## 6. Audio size / chunking
 
 HyperBit does not try to shove a large audio file into the micro:bit.
 
 Microphone audio is streamed as tiny BLE packets while the logo is held.
 
-TTS is split by the PC into segments of at most 4096 ADPCM bytes. Each segment is then split into BLE-sized packets. The PC waits for the micro:bit to finish one segment before sending the next.
+TTS is split by the PC into segments of at most **512 ADPCM bytes**. Each segment is then split into <=20-byte NUS frames. The PC waits for the micro:bit to finish one segment before sending the next.
 
 ## Troubleshooting BLE
 
 If the agent says no HyperBit was found, the launcher prints every BLE device Windows saw, including names, addresses, and advertised service UUIDs. Copy that block back for diagnosis.
+
+Every scanned release also includes `BUILD_PROVENANCE.txt`, which records the exact source-tree hash, CODAL commit, BLE config verification, and calculated CODAL heap capacity used to produce that HEX.
