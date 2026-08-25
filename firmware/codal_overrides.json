@@ -1,0 +1,8 @@
+{
+  "expected_codal_microbit_v2_commit": "26af67ef621b8d99d8be1722ea6e09f3387301a4",
+  "hvn_tx_queue_size": 12,
+  "application_ram_origin": "0x20006000",
+  "noinit_origin": "0x20005ff0",
+  "ram_end": "0x20020000",
+  "stack_reserve_bytes": 2048
+}
