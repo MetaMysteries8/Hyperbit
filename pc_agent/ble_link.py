@@ -32,6 +32,11 @@ STATE_SPEAKING = 5
 STATE_ERROR = 6
 
 TTS_SEGMENT_BYTES = 4096
+GATT_CONNECT_TIMEOUT_SECONDS = 35.0
+# Firmware evicts a half-open raw BLE link after ~45 seconds. If a Windows
+# GATT attempt consumes the full 35-second timeout, wait long enough for that
+# eviction/disconnect cycle to finish before opening the next connection.
+GATT_RECOVERY_WAIT_SECONDS = 15.0
 
 
 @dataclass
@@ -127,15 +132,16 @@ class HyperBitBLE:
         # between retries makes Windows lose the exact device we already found.
         dev = await self._find()
 
-        # Prefer Windows' cache first because it avoids a full uncached attribute
-        # walk when the layout is already known. If the cached layout is stale or
-        # missing HyperBit, retry uncached. Do not request only SERVICE_UUID here:
-        # WinRT uses a separate GetGattServicesForUuidAsync path for that filter,
-        # which has proven less useful for this DIY peripheral during recovery.
+        # Start with Windows' cache because a valid cache is fastest. If that
+        # attempt times out or exposes a stale layout, every recovery attempt is
+        # uncached. Never return to the same potentially stale cache after a
+        # failure. The recovery delay is deliberately longer than the difference
+        # between Bleak's 35-second connect timeout and firmware's ~45-second
+        # half-open watchdog, so a fresh attempt does not get evicted mid-GATT.
         attempts = [
             (True, "Windows cached GATT"),
-            (False, "fresh/uncached full GATT"),
-            (True, "cached GATT retry"),
+            (False, "fresh/uncached full GATT after firmware recovery"),
+            (False, "fresh/uncached full GATT retry"),
         ]
         last_error: BaseException | None = None
 
@@ -143,9 +149,10 @@ class HyperBitBLE:
             if attempt > 1:
                 print(
                     f"[ble] retry {attempt}/{len(attempts)}: reusing {dev.address}; "
-                    f"waiting 5 seconds before {label}..."
+                    f"waiting {GATT_RECOVERY_WAIT_SECONDS:.0f}s for firmware BLE eviction/recovery "
+                    f"before {label}..."
                 )
-                await asyncio.sleep(5.0)
+                await asyncio.sleep(GATT_RECOVERY_WAIT_SECONDS)
 
             print(
                 f"[ble] connecting to {dev.name or 'micro:bit'} ({dev.address}) "
@@ -154,7 +161,7 @@ class HyperBitBLE:
 
             self.client = BleakClient(
                 dev,
-                timeout=35.0,
+                timeout=GATT_CONNECT_TIMEOUT_SECONDS,
                 pair=False,
                 winrt={"use_cached_services": use_cache},
             )
@@ -165,7 +172,10 @@ class HyperBitBLE:
                 chars = self._resolve_hyperbit_chars()
                 if chars is None:
                     if use_cache:
-                        print("[ble] cached GATT connected but HyperBit service/layout was stale; retrying uncached")
+                        print(
+                            "[ble] cached GATT connected but HyperBit service/layout was stale; "
+                            "waiting for a clean disconnect before uncached discovery"
+                        )
                         await self._disconnect_partial()
                         continue
 
@@ -197,9 +207,10 @@ class HyperBitBLE:
 
         raise RuntimeError(
             "Windows found the micro:bit but could not establish a usable HyperBit GATT session "
-            "after three attempts. The same BLEDevice was reused, so this is no longer a "
-            "re-advertising/rescan failure. If the micro:bit face also stops animating during "
-            "the attempt, the firmware/SoftDevice side is stalling and should be diagnosed next."
+            "after three attempts. The same BLEDevice was reused and both recovery attempts were "
+            "uncached and started after the firmware half-open eviction window. If the micro:bit "
+            "face also stops animating during the attempt, the firmware/SoftDevice side is stalling "
+            "and should be diagnosed next."
         ) from last_error
 
     def _mic_notify(self, _sender, data: bytearray):
