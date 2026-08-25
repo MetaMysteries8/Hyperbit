@@ -12,6 +12,7 @@ public:
 
     bool breath();
     bool steady(uint8_t brightness);
+    bool setBrightnessFast(uint8_t brightness);
     bool off();
     bool selfTest();
     bool ok() const { return lastOk; }
