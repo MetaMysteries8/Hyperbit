@@ -3,10 +3,16 @@
 
 class WukongLights {
     codal::I2C &i2c;
-    void write4(uint8_t reg, uint8_t value);
+    bool lastOk;
+
+    bool write4(uint8_t reg, uint8_t value);
+
 public:
-    WukongLights(codal::I2C &bus) : i2c(bus) {}
-    void breath();
-    void steady(uint8_t brightness);
-    void off();
+    explicit WukongLights(codal::I2C &bus);
+
+    bool breath();
+    bool steady(uint8_t brightness);
+    bool off();
+    bool selfTest();
+    bool ok() const { return lastOk; }
 };
