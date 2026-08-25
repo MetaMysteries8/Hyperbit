@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from typing import Any
 
 from bleak import BleakClient, BleakScanner
 
@@ -16,6 +17,13 @@ FRAME_MIC = 0xA1
 FRAME_TTS = 0xA2
 FRAME_HELLO = 0xA3
 PROTOCOL_VERSION = 2
+MIN_FIRMWARE_REVISION = 3
+
+CAP_CONNECTION_ISOLATION = 0x01
+CAP_SAFE_RAINBOW_PWM = 0x02
+CAP_SEGMENTED_TTS = 0x04
+REQUIRED_CAPABILITIES = CAP_CONNECTION_ISOLATION | CAP_SEGMENTED_TTS
+
 AUDIO_PAYLOAD_BYTES = 17
 
 EVT_PTT_START = 0x10
@@ -45,11 +53,24 @@ GATT_RECOVERY_WAIT_SECONDS = 15.0
 HELLO_TIMEOUT_SECONDS = 5.0
 
 
+class BLEDisconnectedError(RuntimeError):
+    """Raised when a previously validated HyperBit session disappears."""
+
+
 @dataclass
 class Utterance:
     adpcm: bytes
     sample_count: int
     overflow: bool
+
+
+@dataclass
+class Candidate:
+    # Keep the advertisement-derived identity next to the concrete BLEDevice.
+    # Windows can expose adv.local_name while BLEDevice.name is blank/different.
+    device: Any
+    display_name: str
+    is_microbit: bool
 
 
 class HyperBitBLE:
@@ -59,79 +80,110 @@ class HyperBitBLE:
         self.client: BleakClient | None = None
         self.tx_char = None
         self.rx_char = None
+
+        self.firmware_revision = 0
+        self.capabilities = 0
+
         self._recv = bytearray()
         self._seq = None
+        self._mic_gap = False
         self._utterances: asyncio.Queue[Utterance] = asyncio.Queue()
         self._replay_requests: asyncio.Queue[None] = asyncio.Queue()
         self._loop = None
         self._cancel = asyncio.Event()
         self._ready = asyncio.Event()
+        self._ready_error: str | None = None
         self._tts_done = asyncio.Event()
         self._tts_done_ok = True
+        self._disconnect_event = asyncio.Event()
         self._tx_lock = asyncio.Lock()
+        self._session_active = False
+        self._closing = False
 
     @staticmethod
     def _looks_like_microbit(name: str) -> bool:
         n = name.lower()
         return "micro:bit" in n or "microbit" in n
 
-    async def _find_candidates(self):
-        """Return BLE devices worth validating with the HyperBit HELLO handshake.
+    @staticmethod
+    def _clear_queue(queue: asyncio.Queue):
+        while True:
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
 
-        NUS is intentionally a standard/shared service, so merely advertising the
-        NUS UUID does not prove a device is HyperBit. Explicit address/name hints
-        take precedence. Otherwise BBC micro:bit-looking names are tried before
-        generic NUS peripherals, and every returned candidate may be validated.
+    def _reset_runtime_state(self):
+        self._recv.clear()
+        self._seq = None
+        self._mic_gap = False
+        self._cancel.clear()
+        self._ready.clear()
+        self._ready_error = None
+        self._tts_done.clear()
+        self._tts_done_ok = True
+        self.firmware_revision = 0
+        self.capabilities = 0
+        self._clear_queue(self._utterances)
+        self._clear_queue(self._replay_requests)
+
+    async def _find_candidates(self):
+        """Return BLE candidates with their advertisement-derived classification.
+
+        NUS is a standard/shared service, so advertising it does not prove a
+        device is HyperBit. Explicit address/name hints take precedence. Without
+        hints, micro:bit-looking advertisements are tried before generic NUS
+        peripherals and every candidate must pass HyperBit HELLO/READY.
         """
         print("[ble] scanning 10 seconds...")
         found = await BleakScanner.discover(timeout=10.0, return_adv=True)
         seen = []
-        exact_address = []
-        name_matches = []
-        microbits = []
-        generic_nus = []
+        exact_address: list[Candidate] = []
+        name_matches: list[Candidate] = []
+        microbits: list[Candidate] = []
+        generic_nus: list[Candidate] = []
 
         for _key, pair in found.items():
             device, adv = pair
-            name = adv.local_name or device.name or ""
+            display_name = adv.local_name or device.name or ""
             service_uuids = [u.lower() for u in (adv.service_uuids or [])]
-            seen.append((name or "<unnamed>", device.address, service_uuids))
+            is_microbit = self._looks_like_microbit(display_name)
+            candidate = Candidate(device, display_name or "<unnamed>", is_microbit)
+            seen.append((candidate.display_name, device.address, service_uuids))
 
             if self.address and device.address.lower() == self.address.lower():
-                exact_address.append(device)
+                exact_address.append(candidate)
                 continue
 
             if self.name_hint:
-                if self.name_hint.lower() in name.lower():
-                    name_matches.append(device)
+                if self.name_hint.lower() in display_name.lower():
+                    name_matches.append(candidate)
                 continue
 
-            if self._looks_like_microbit(name):
-                microbits.append(device)
+            if is_microbit:
+                microbits.append(candidate)
                 continue
 
             if SERVICE_UUID.lower() in service_uuids:
-                generic_nus.append(device)
+                generic_nus.append(candidate)
 
         if self.address:
             candidates = exact_address
         elif self.name_hint:
             candidates = name_matches
         else:
-            # A standard NUS peripheral is not necessarily HyperBit. Prefer the
-            # micro:bit identity, then validate any remaining NUS devices too.
             candidates = microbits + generic_nus
 
-        # Windows can surface the same peripheral through multiple discovery
-        # records. Keep candidate order while deduplicating by address.
-        unique = []
+        # Windows can surface one peripheral through multiple discovery records.
+        # Keep ranking order while deduplicating by address.
+        unique: list[Candidate] = []
         used_addresses = set()
-        for device in candidates:
-            key = device.address.lower()
+        for candidate in candidates:
+            key = candidate.device.address.lower()
             if key in used_addresses:
                 continue
             used_addresses.add(key)
-            unique.append(device)
+            unique.append(candidate)
 
         if not unique:
             print("[ble] no HyperBit candidate matched. Devices seen by Windows:")
@@ -142,27 +194,41 @@ class HyperBitBLE:
                 print(f"  {name}  {address}  services={s}")
             raise RuntimeError(
                 "No advertising HyperBit/micro:bit found. If the board is listed above, "
-                "send that block back so the firmware/advertising can be diagnosed."
+                "send that block back so firmware/advertising can be diagnosed."
             )
 
         print(f"[ble] {len(unique)} candidate(s) will be validated with HyperBit HELLO")
-        for index, device in enumerate(unique, 1):
-            print(f"  [{index}] {device.name or '<unnamed>'} ({device.address})")
+        for index, candidate in enumerate(unique, 1):
+            kind = "micro:bit" if candidate.is_microbit else "generic NUS"
+            print(f"  [{index}] {candidate.display_name} ({candidate.device.address}) [{kind}]")
         return unique
 
+    def _mark_unexpected_disconnect(self):
+        if self._closing or not self._session_active:
+            return
+        self._session_active = False
+        self._cancel.set()
+        self._disconnect_event.set()
+        print("[ble] HyperBit disconnected unexpectedly")
+
+    def _on_disconnected(self, _client):
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(self._mark_unexpected_disconnect)
+
     async def _disconnect_partial(self):
-        if not self.client:
+        self._session_active = False
+        client = self.client
+        self.client = None
+        self.tx_char = None
+        self.rx_char = None
+        self._ready.clear()
+        if not client:
             return
         try:
-            if self.client.is_connected:
-                await asyncio.wait_for(self.client.disconnect(), timeout=5.0)
+            if client.is_connected:
+                await asyncio.wait_for(client.disconnect(), timeout=5.0)
         except Exception:
             pass
-        finally:
-            self.client = None
-            self.tx_char = None
-            self.rx_char = None
-            self._ready.clear()
 
     def _resolve_nus_chars(self):
         assert self.client is not None
@@ -178,19 +244,29 @@ class HyperBitBLE:
     async def _write_frame(self, payload: bytes):
         if len(payload) > 20:
             raise ValueError(f"NUS frame too large: {len(payload)} bytes")
-        assert self.client and self.rx_char
+        if self.client is None or self.rx_char is None:
+            raise BLEDisconnectedError("HyperBit BLE session is not connected")
+
         props = {p.lower() for p in self.rx_char.properties}
         response = "write-without-response" not in props
-        await self.client.write_gatt_char(self.rx_char, payload, response=response)
+        try:
+            await self.client.write_gatt_char(self.rx_char, payload, response=response)
+        except Exception as exc:
+            if self._session_active or self._disconnect_event.is_set() or not self.client.is_connected:
+                self._mark_unexpected_disconnect()
+                raise BLEDisconnectedError("HyperBit disconnected during BLE write") from exc
+            raise
 
-    async def _try_candidate(self, dev, candidate_index: int, candidate_count: int):
+    async def _try_candidate(self, candidate: Candidate, candidate_index: int, candidate_count: int):
+        dev = candidate.device
+        # Service migration makes stale Windows caches especially unhelpful. Start
+        # uncached, recover uncached once more, then keep cache as a final fallback.
         attempts = [
-            (True, "Windows cached services"),
+            (False, "fresh/uncached services"),
             (False, "fresh/uncached services after firmware recovery"),
-            (False, "fresh/uncached services retry"),
+            (True, "Windows cached-services fallback"),
         ]
         last_error: BaseException | None = None
-        looks_like_microbit = self._looks_like_microbit(dev.name or "")
 
         for attempt, (use_cache, label) in enumerate(attempts, 1):
             if attempt > 1:
@@ -202,13 +278,14 @@ class HyperBitBLE:
 
             print(
                 f"[ble] candidate {candidate_index}/{candidate_count}: connecting to "
-                f"{dev.name or '<unnamed>'} ({dev.address}) using {label}"
+                f"{candidate.display_name} ({dev.address}) using {label}"
             )
 
             self.client = BleakClient(
                 dev,
                 timeout=GATT_CONNECT_TIMEOUT_SECONDS,
                 pair=False,
+                disconnected_callback=self._on_disconnected,
                 winrt={"use_cached_services": use_cache},
             )
 
@@ -217,21 +294,20 @@ class HyperBitBLE:
 
                 chars = self._resolve_nus_chars()
                 if chars is None:
-                    if use_cache:
-                        print("[ble] cached service layout is stale; retrying uncached")
-                        await self._disconnect_partial()
-                        continue
-
-                    print("[ble] candidate has no usable Nordic UART Service; moving on")
+                    print("[ble] candidate has no usable Nordic UART Service")
                     await self._disconnect_partial()
-                    return False, RuntimeError("Nordic UART Service is missing")
+                    if use_cache:
+                        return False, RuntimeError("Nordic UART Service is missing")
+                    continue
 
                 self.tx_char, self.rx_char = chars
                 self._loop = asyncio.get_running_loop()
                 self._ready.clear()
+                self._ready_error = None
 
                 # NUS is shared by many products. Subscription + protocol HELLO is
-                # the actual HyperBit identity check.
+                # the actual identity check. Firmware accepts HELLO only after the
+                # TX CCCD has been enabled by start_notify().
                 await self.client.start_notify(self.tx_char, self._nus_notify)
                 await self._write_frame(bytes([FRAME_HELLO, PROTOCOL_VERSION]))
 
@@ -243,21 +319,39 @@ class HyperBitBLE:
                     )
                     await self._disconnect_partial()
 
-                    # An unrelated generic NUS device is definitively not worth
-                    # spending two 35s + recovery retries on. A named micro:bit
-                    # can still be the right board with a transient BLE problem.
-                    if not looks_like_microbit and not self.address and not self.name_hint:
+                    # Preserve the classification obtained from adv.local_name.
+                    # Generic NUS devices get one identity attempt; likely
+                    # micro:bits and explicit hints receive the recovery retries.
+                    if not candidate.is_microbit and not self.address and not self.name_hint:
                         print("[ble] generic NUS device did not answer HyperBit HELLO; moving on")
                         return False, last_error
                     continue
 
+                if self._ready_error:
+                    last_error = RuntimeError(self._ready_error)
+                    print(f"[ble] candidate rejected: {self._ready_error}")
+                    await self._disconnect_partial()
+                    # A stale HyperBit is definitely the selected device; repeating
+                    # the same incompatible handshake will not repair its firmware.
+                    return False, last_error
+
+                if not self.client.is_connected:
+                    raise BLEDisconnectedError("HyperBit disconnected immediately after READY")
+
+                self._session_active = True
+                self._disconnect_event.clear()
+                self._cancel.clear()
                 print(
-                    f"[ble] HyperBit validated and connected over Nordic UART Service; "
-                    f"protocol v{PROTOCOL_VERSION}"
+                    f"[ble] HyperBit validated: protocol v{PROTOCOL_VERSION}, "
+                    f"firmware r{self.firmware_revision}, capabilities=0x{self.capabilities:02x}"
                 )
                 await self.set_state(STATE_IDLE)
                 return True, None
 
+            except BLEDisconnectedError as exc:
+                last_error = exc
+                print(f"[ble] session dropped during setup: {exc}")
+                await self._disconnect_partial()
             except (TimeoutError, asyncio.TimeoutError) as exc:
                 last_error = exc
                 print("[ble] Windows timed out while establishing the BLE service session.")
@@ -274,11 +368,17 @@ class HyperBitBLE:
         return False, last_error
 
     async def connect(self):
+        self._closing = False
+        self._session_active = False
+        self._disconnect_event.clear()
+        self._reset_runtime_state()
+        self._loop = asyncio.get_running_loop()
+
         candidates = await self._find_candidates()
         last_error: BaseException | None = None
 
-        for index, dev in enumerate(candidates, 1):
-            ok, error = await self._try_candidate(dev, index, len(candidates))
+        for index, candidate in enumerate(candidates, 1):
+            ok, error = await self._try_candidate(candidate, index, len(candidates))
             if ok:
                 return
             if error is not None:
@@ -288,9 +388,9 @@ class HyperBitBLE:
 
         raise RuntimeError(
             "Windows found Bluetooth candidates but none established a usable HyperBit NUS "
-            "HELLO/READY session. Firmware now disables the LED matrix and all peripheral "
-            "activity during the raw connection window, so a timeout on a BBC micro:bit "
-            "candidate points at the BLE/security/runtime layer rather than fluid rendering."
+            "HELLO/READY session. If a candidate reports an old firmware revision, flash the "
+            "HyperBit.hex from the same release ZIP as this PC agent. Otherwise a timeout on "
+            "a BBC micro:bit candidate points at the BLE/runtime layer, not fluid rendering."
         ) from last_error
 
     def _nus_notify(self, _sender, data: bytearray):
@@ -307,6 +407,7 @@ class HyperBitBLE:
             payload = bytes(data[3:3 + n])
             if self._seq is not None and seq != ((self._seq + 1) & 0xFF):
                 print(f"[ble] mic packet gap: expected {(self._seq + 1) & 0xFF}, got {seq}")
+                self._mic_gap = True
             self._seq = seq
             self._recv.extend(payload)
             return
@@ -322,21 +423,40 @@ class HyperBitBLE:
         if code == EVT_PTT_START:
             self._recv.clear()
             self._seq = None
+            self._mic_gap = False
             self._cancel.clear()
             print("[device] gold logo down: microphone ON")
 
         elif code == EVT_PTT_END:
             samples = a | (b << 8) | ((c & 0x7F) << 16)
-            overflow = bool(c & 0x80)
+            overflow = bool(c & 0x80) or self._mic_gap
             utt = Utterance(bytes(self._recv), samples, overflow)
             self._loop.call_soon_threadsafe(self._utterances.put_nowait, utt)
             print(f"[device] gold logo up: microphone OFF; {len(self._recv)} ADPCM bytes")
 
         elif code == EVT_READY:
+            self.firmware_revision = b
+            self.capabilities = c
             if a != PROTOCOL_VERSION:
-                print(f"[device] protocol mismatch: firmware={a}, pc={PROTOCOL_VERSION}")
-                return
-            print(f"[device] firmware ready; NUS transport protocol v{a}")
+                self._ready_error = (
+                    f"protocol mismatch: firmware={a}, pc={PROTOCOL_VERSION}"
+                )
+            elif b < MIN_FIRMWARE_REVISION:
+                self._ready_error = (
+                    f"stale HyperBit firmware revision {b}; this PC agent requires "
+                    f"revision {MIN_FIRMWARE_REVISION}+"
+                )
+            elif (c & REQUIRED_CAPABILITIES) != REQUIRED_CAPABILITIES:
+                self._ready_error = (
+                    f"firmware r{b} is missing required capabilities "
+                    f"0x{REQUIRED_CAPABILITIES:02x} (reported 0x{c:02x})"
+                )
+            else:
+                self._ready_error = None
+                print(
+                    f"[device] firmware READY: protocol={a} revision={b} "
+                    f"capabilities=0x{c:02x}"
+                )
             self._loop.call_soon_threadsafe(self._ready.set)
 
         elif code == EVT_CANCEL:
@@ -357,11 +477,35 @@ class HyperBitBLE:
         elif code == EVT_WUKONG_STATUS:
             print(f"[device] Wukong I2C base LEDs: {'OK' if a else 'NOT RESPONDING'}")
 
+    async def _queue_or_disconnect(self, queue: asyncio.Queue):
+        if self._disconnect_event.is_set():
+            raise BLEDisconnectedError("HyperBit BLE session disconnected")
+
+        item_task = asyncio.create_task(queue.get())
+        disconnect_task = asyncio.create_task(self._disconnect_event.wait())
+        done, pending = await asyncio.wait(
+            {item_task, disconnect_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+
+        if disconnect_task in done and disconnect_task.result():
+            item_task.cancel()
+            raise BLEDisconnectedError("HyperBit BLE session disconnected")
+        return item_task.result()
+
     async def next_utterance(self):
-        return await self._utterances.get()
+        return await self._queue_or_disconnect(self._utterances)
 
     async def next_replay_request(self):
-        await self._replay_requests.get()
+        await self._queue_or_disconnect(self._replay_requests)
+
+    async def wait_disconnected(self):
+        await self._disconnect_event.wait()
+
+    def is_connected(self):
+        return bool(self._session_active and self.client and self.client.is_connected)
 
     def cancelled(self):
         return self._cancel.is_set()
@@ -400,8 +544,6 @@ class HyperBitBLE:
         self._tts_done.clear()
         self._tts_done_ok = True
 
-        # Start frame is always fixed-width so a zero high-byte/first flag is not
-        # accidentally omitted by compact control encoding.
         await self._write_frame(
             bytes([
                 FRAME_CONTROL,
@@ -424,10 +566,29 @@ class HyperBitBLE:
 
         await self._write_control(CMD_TTS_END)
 
+        ack_task = asyncio.create_task(self._tts_done.wait())
+        disconnect_task = asyncio.create_task(self._disconnect_event.wait())
         try:
-            await asyncio.wait_for(self._tts_done.wait(), timeout=8.0)
-        except asyncio.TimeoutError:
-            raise RuntimeError("micro:bit did not acknowledge the TTS segment")
+            done, pending = await asyncio.wait(
+                {ack_task, disconnect_task},
+                timeout=8.0,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            if not done:
+                try:
+                    await self.abort_tts()
+                except Exception:
+                    pass
+                raise RuntimeError("micro:bit did not acknowledge the TTS segment")
+            if disconnect_task in done and disconnect_task.result():
+                raise BLEDisconnectedError("HyperBit disconnected during TTS")
+        finally:
+            if not ack_task.done():
+                ack_task.cancel()
+            if not disconnect_task.done():
+                disconnect_task.cancel()
 
         return self._tts_done_ok and not self.cancelled()
 
@@ -444,11 +605,15 @@ class HyperBitBLE:
             return True
 
     async def close(self):
-        if self.client:
+        self._closing = True
+        self._session_active = False
+        client = self.client
+        self.client = None
+        self.tx_char = None
+        self.rx_char = None
+        if client:
             try:
-                if self.client.is_connected:
-                    await self.client.disconnect()
-            finally:
-                self.client = None
-                self.tx_char = None
-                self.rx_char = None
+                if client.is_connected:
+                    await client.disconnect()
+            except Exception:
+                pass
