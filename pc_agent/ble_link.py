@@ -96,23 +96,82 @@ class HyperBitBLE:
         print(f"[ble] selected {device.name or 'micro:bit'} ({device.address})")
         return device
 
-    async def connect(self):
-        dev = await self._find()
-        print(f"[ble] connecting to {dev.name or 'micro:bit'} ({dev.address})")
-        self.client = BleakClient(dev, timeout=20.0)
-        await self.client.connect()
+    async def _disconnect_partial(self):
+        if not self.client:
+            return
+        try:
+            if self.client.is_connected:
+                await asyncio.wait_for(self.client.disconnect(), timeout=5.0)
+        except Exception:
+            pass
+        finally:
+            self.client = None
 
+    async def connect(self):
+        # Windows caches GATT layouts very aggressively. HyperBit is a DIY device
+        # whose services can change as firmware is reflashed, so force a fresh
+        # service read first and ask Bleak to resolve only our service UUID.
+        attempts = [
+            (False, "fresh/uncached GATT"),
+            (False, "fresh/uncached GATT retry"),
+            (True, "Windows cached GATT fallback"),
+        ]
+        last_error: BaseException | None = None
+
+        for attempt, (use_cache, label) in enumerate(attempts, 1):
+            if attempt == 1:
+                dev = await self._find()
+            else:
+                print(f"[ble] retry {attempt}/{len(attempts)}: rescanning before {label}...")
+                await asyncio.sleep(1.0)
+                dev = await self._find()
+
+            print(
+                f"[ble] connecting to {dev.name or 'micro:bit'} ({dev.address}) "
+                f"using {label}"
+            )
+
+            self.client = BleakClient(
+                dev,
+                timeout=35.0,
+                services=[SERVICE_UUID],
+                pair=False,
+                winrt={"use_cached_services": use_cache},
+            )
+
+            try:
+                await self.client.connect()
+                break
+            except (TimeoutError, asyncio.TimeoutError) as exc:
+                last_error = exc
+                print("[ble] Windows timed out while reading GATT services.")
+                await self._disconnect_partial()
+            except Exception as exc:
+                last_error = exc
+                print(f"[ble] connection attempt failed: {type(exc).__name__}: {exc}")
+                await self._disconnect_partial()
+        else:
+            raise RuntimeError(
+                "Windows found the micro:bit but could not finish GATT service discovery after "
+                "three attempts. If BBC micro:bit appears in Windows Settings > Bluetooth & devices, "
+                "remove that saved device once, power-cycle the micro:bit/Wukong, and run HyperBit again. "
+                "This clears Windows' old micro:bit GATT/pairing cache."
+            ) from last_error
+
+        assert self.client is not None
         svc = self.client.services.get_service(SERVICE_UUID)
         if svc is None:
             print("[ble] services present on connected device:")
             for s in self.client.services:
                 print(" ", s.uuid)
+            await self._disconnect_partial()
             raise RuntimeError("The board was found, but the HyperBit BLE service is missing.")
 
         self.mic_char = svc.get_characteristic(MIC_UUID)
         self.speaker_char = svc.get_characteristic(SPEAKER_UUID)
         self.control_char = svc.get_characteristic(CONTROL_UUID)
         if not all((self.mic_char, self.speaker_char, self.control_char)):
+            await self._disconnect_partial()
             raise RuntimeError("HyperBit service is missing one or more characteristics.")
 
         self._loop = asyncio.get_running_loop()
