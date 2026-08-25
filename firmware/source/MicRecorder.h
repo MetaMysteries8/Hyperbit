@@ -3,26 +3,33 @@
 #include "DataStream.h"
 #include "ImaAdpcm.h"
 
-#define HYPERBIT_MAX_MIC_ADPCM 16000
+#define HYPERBIT_MIC_RING_BYTES 1024
 
 class MicRecorder : public codal::DataSink {
     codal::DataSource &upstream;
     volatile bool recording;
-    volatile bool full;
-    uint16_t encodedLen;
-    uint16_t sampleCount;
+    volatile bool overflow;
+    volatile uint16_t head;
+    volatile uint16_t tail;
+    uint32_t sampleCount;
     bool halfNibble;
     uint8_t pendingByte;
     ImaAdpcmState adpcm;
 
+    bool pushByte(uint8_t value);
+
 public:
-    MicRecorder(codal::DataSource &source);
+    explicit MicRecorder(codal::DataSource &source);
     virtual int pullRequest();
+
     void start();
     void stop();
+
     bool isRecording() const { return recording; }
-    bool overflowed() const { return full; }
-    uint16_t length() const { return encodedLen; }
-    uint16_t samples() const { return sampleCount; }
-    const uint8_t *data() const;
+    bool overflowed() const { return overflow; }
+    uint32_t samples() const { return sampleCount; }
+
+    int available() const;
+    int read(uint8_t *out, int maxLen);
+    void markTransportOverflow() { overflow = true; }
 };
