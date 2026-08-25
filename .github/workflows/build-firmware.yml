@@ -130,6 +130,28 @@ jobs:
             exit 1
           fi
 
+          ELF=.build/microbit-v2-samples/build/MICROBIT
+          test -f "$ELF"
+
+          # CODAL's softdevice linker script intentionally expands .heap until
+          # RAM_END - 0x800, so the generic GNU 'RAM % used' number is expected
+          # to stay around 98.33% and is NOT a measure of free heap. Measure the
+          # real heap capacity from __end__ (start of .heap) instead.
+          END_HEX="$(arm-none-eabi-nm -n "$ELF" | awk '$3 == "__end__" {print $1; exit}')"
+          test -n "$END_HEX"
+          STATIC_END=$((0x${END_HEX}))
+          RAM_START=$((0x20002040))
+          RAM_END=$((0x20020000))
+          STACK_RESERVE=$((0x800))
+          HEAP_LIMIT=$((RAM_END - STACK_RESERVE))
+          STATIC_RAM_BYTES=$((STATIC_END - RAM_START))
+          HEAP_CAPACITY_BYTES=$((HEAP_LIMIT - STATIC_END))
+
+          if (( HEAP_CAPACITY_BYTES <= 0 )); then
+            echo "ERROR: no CODAL heap capacity remains after static allocations." >&2
+            exit 1
+          fi
+
           CODAL_COMMIT="$(git -C .build/microbit-v2-samples/libraries/codal-microbit-v2 rev-parse HEAD)"
           {
             echo "HyperBit build provenance"
@@ -142,8 +164,12 @@ jobs:
             echo "voice_h_sha256=$(sha256sum firmware/source/VoiceBLEService.h | awk '{print $1}')"
             echo "codal_json_sha256=$(sha256sum firmware/codal.json | awk '{print $1}')"
             echo "pc_ble_link_sha256=$(sha256sum pc_agent/ble_link.py | awk '{print $1}')"
+            echo "static_ram_end=0x${END_HEX}"
+            echo "static_ram_bytes=${STATIC_RAM_BYTES}"
+            echo "codal_heap_capacity_bytes=${HEAP_CAPACITY_BYTES}"
+            echo "stack_reserve_bytes=${STACK_RESERVE}"
             echo
-            echo "Linker memory summary:"
+            echo "GNU linker region summary (includes CODAL's fill-to-limit .heap section):"
             grep -E '^[[:space:]]+(FLASH|RAM):' dist/firmware-build.log || true
           } > dist/BUILD_PROVENANCE.txt
 
@@ -187,6 +213,7 @@ jobs:
           - Successful CODAL/GNU Arm compilation of the micro:bit V2 firmware.
           - Verification that the injected build files byte-match this commit.
           - Verification that BLE security mode was not redefined during compilation.
+          - Extraction of actual CODAL heap capacity from the linked ELF.
           - ClamAV scan of the final release ZIP and HEX before publication.
 
           Release build: ${GITHUB_RUN_NUMBER}
@@ -221,7 +248,7 @@ jobs:
 
           - **HyperBit-release.zip** — recommended package. Contains compiled firmware, the one-click Windows launcher, Python agent, docs, config template, flashing helpers, and build provenance.
           - **HyperBit.hex** — firmware only for a BBC micro:bit V2.
-          - **BUILD_PROVENANCE.txt** — exact commit/source hashes/CODAL commit used by the firmware build.
+          - **BUILD_PROVENANCE.txt** — exact commit/source hashes/CODAL commit and real heap-capacity measurement used by the firmware build.
           - **CHECKSUMS.sha256** — SHA-256 checksums for the firmware and ZIP.
 
           ## Hardware controls
@@ -234,7 +261,7 @@ jobs:
 
           ## Release gates
 
-          This release was published only after Python syntax checks, Bandit static analysis, dependency auditing, ClamAV source/package scans, source-injection provenance checks, BLE security-config verification, and the micro:bit V2 firmware build completed successfully.
+          This release was published only after Python syntax checks, Bandit static analysis, dependency auditing, ClamAV source/package scans, source-injection provenance checks, BLE security-config verification, real heap-capacity extraction, and the micro:bit V2 firmware build completed successfully.
           EOF
 
       - name: Upload workflow artifact
@@ -286,6 +313,7 @@ jobs:
           echo "- ClamAV source scan: ✅" >> "$GITHUB_STEP_SUMMARY"
           echo "- Source/build provenance verified: ✅" >> "$GITHUB_STEP_SUMMARY"
           echo "- BLE security macro conflict absent: ✅" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Real CODAL heap capacity extracted: ✅" >> "$GITHUB_STEP_SUMMARY"
           echo "- ClamAV release scan: ✅" >> "$GITHUB_STEP_SUMMARY"
           echo "- SHA-256 checksums generated: ✅" >> "$GITHUB_STEP_SUMMARY"
           if [ "${{ github.event_name }}" != "pull_request" ]; then
