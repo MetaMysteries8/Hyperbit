@@ -10,14 +10,15 @@
 #define HYPERBIT_NUS_AUDIO_PAYLOAD 17
 #define HYPERBIT_PROTOCOL_VERSION 2
 
-// Protocol v2 stays wire-compatible while this revision identifies the minimum
-// firmware that has the connection-isolation/NUS fixes. READY reports both so
-// the PC can reject a stale HEX instead of silently debugging the wrong build.
-#define HYPERBIT_FIRMWARE_REVISION 3
+// Protocol v2 stays wire-compatible while the firmware revision identifies the
+// minimum implementation required by the PC. READY reports both revision and
+// capabilities so a stale HEX is rejected instead of being debugged by accident.
+#define HYPERBIT_FIRMWARE_REVISION 4
 #define HYPERBIT_CAP_CONNECTION_ISOLATION 0x01
 #define HYPERBIT_CAP_SAFE_RAINBOW_PWM      0x02
 #define HYPERBIT_CAP_SEGMENTED_TTS         0x04
-#define HYPERBIT_CAPABILITIES (HYPERBIT_CAP_CONNECTION_ISOLATION | HYPERBIT_CAP_SAFE_RAINBOW_PWM | HYPERBIT_CAP_SEGMENTED_TTS)
+#define HYPERBIT_CAP_BUFFERED_HVN          0x08
+#define HYPERBIT_CAPABILITIES (HYPERBIT_CAP_CONNECTION_ISOLATION | HYPERBIT_CAP_SAFE_RAINBOW_PWM | HYPERBIT_CAP_SEGMENTED_TTS | HYPERBIT_CAP_BUFFERED_HVN)
 
 enum HyperBitCharIndex {
     HB_NUS_TX = 0,
