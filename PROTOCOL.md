@@ -14,15 +14,16 @@ Audio is 8 kHz mono IMA ADPCM. Every new microphone utterance starts with predic
 
 ## Versioning
 
-The current wire protocol is **v2** and the hardened firmware revision is **r3**.
+The current wire protocol is **v2** and the hardened firmware revision is **r4**.
 
-Protocol version and firmware revision are separate on purpose: compatible protocol-v2 firmware can gain runtime fixes without gratuitously changing every packet definition. The PC requires firmware revision 3 or newer so an accidentally flashed old HEX is diagnosed immediately.
+Protocol version and firmware revision are separate on purpose: compatible protocol-v2 firmware can gain runtime fixes without gratuitously changing every packet definition. The PC requires firmware revision 4 or newer so an accidentally flashed old HEX is diagnosed immediately.
 
 Current capability bits reported by firmware:
 
 - `0x01` — connection-isolated handshake: display/peripherals stay suspended until READY is queued.
 - `0x02` — Wukong Rainbow LEDs use the BLE-safe hardware-PWM NeoPixel path.
 - `0x04` — acknowledged segmented TTS transport.
+- `0x08` — buffered SoftDevice server-notification transport for streamed microphone audio.
 
 ## Session handshake
 
@@ -38,17 +39,27 @@ Current capability bits reported by firmware:
 4. Firmware accepts HELLO **only if TX notifications are already enabled**.
 5. Firmware attempts to queue READY:
 
-   `A0 12 02 03 07`
+   `A0 12 02 04 0F`
 
    - `12` = READY event.
    - `02` = protocol v2.
-   - `03` = firmware revision r3.
-   - `07` = capability bitmask.
+   - `04` = firmware revision r4.
+   - `0F` = capability bitmask.
 
 6. Only after READY is successfully queued does firmware re-enable the 5×5 display and resume accelerometer, Wukong, microphone/button, and normal agent work.
 7. The PC validates protocol, minimum firmware revision, and required capability bits before accepting the device as HyperBit.
 
 A raw Bluetooth connection therefore does **not** mean HyperBit is ready. A generic NUS device cannot pass the session handshake accidentally, and stale HyperBit firmware reports an actionable version error instead of looking like an unexplained transport failure.
+
+## Notification throughput
+
+The microphone produces 8,000 samples per second at 4 bits per IMA-ADPCM sample, or about **4,000 ADPCM bytes per second**. A protocol-v2 microphone packet carries up to 17 audio bytes, so continuous speech needs roughly **236 device-to-PC notifications per second**.
+
+Nordic's S113 GATTS default permits only one queued Handle Value Notification. Firmware r4 therefore uses a reviewed build-time CODAL override that configures a **12-entry GATTS notification queue** before `nrf_sdh_ble_enable()` and reserves additional lower RAM for that SoftDevice configuration. The wire format stays at the default 23-byte ATT MTU / 20-byte characteristic payload for Windows compatibility.
+
+The 512-byte microphone ring remains the second layer of backpressure protection. `sendMic()` retries temporary notification-queue exhaustion; if transport stalls long enough to overrun the ring, the utterance is marked overflowed rather than silently pretending it is intact.
+
+The release build fails if the locked CODAL revision changes unexpectedly, if the queue override is absent/misapplied, if the patched application RAM boundary is not used by the final ELF, or if less than 64 KiB of calculated CODAL heap capacity remains.
 
 ## Frame types
 
