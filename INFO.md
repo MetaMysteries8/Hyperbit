@@ -2,32 +2,49 @@
 
 HyperBit is a PC-hosted voice AI agent with a **BBC micro:bit V2 + ELECFREAKS Wukong** as its physical wireless body.
 
-## What the micro:bit/Wukong does
+## micro:bit V2
 
-- Gold logo push-to-talk control.
-- Built-in microphone capture.
-- Bluetooth Low Energy audio transport.
-- Built-in speaker playback.
-- 5×5 status display.
-- Wukong battery power.
-- Wukong programmable blue base LEDs for agent state.
+- Gold capacitive logo = push-to-talk.
+- Built-in microphone = speech capture.
+- Built-in speaker = spoken responses.
+- A = interrupt/cancel.
+- B = replay.
+- A+B = mute toggle.
+- BLE = bidirectional compressed audio/control.
 
-## What the Windows PC does
+The microphone hardware is only activated while the gold logo is held.
 
-- Local speech-to-text with faster-whisper.
-- Charm Hyper chat-completions/tool-calling agent.
-- Durable memory and a sandboxed workspace.
-- Offline TTS using Windows SAPI.
-- Bluetooth communication using Bleak.
+## Wukong
+
+Wukong is actively driven by the firmware rather than merely serving as a battery holder:
+
+- built-in battery powers the handheld agent,
+- eight blue base LEDs are controlled by Wukong's I2C controller,
+- four Rainbow LEDs on P16 are used for visible agent-state colors,
+- boot performs a visible Wukong self-test.
+
+## Windows PC
+
+The PC is the agent's main home:
+
+- faster-whisper for local speech-to-text,
+- Charm Hyper for the model/tool loop,
+- durable memory and sandboxed workspace,
+- Windows SAPI for local TTS,
+- Bleak for Bluetooth.
+
+The Hyper API key remains on the PC.
 
 ## Audio transport
 
-Voice is transported as 8 kHz mono IMA ADPCM. The current firmware records while the gold logo is held, then transfers the compressed utterance after release.
+Audio is 8 kHz mono IMA ADPCM.
+
+Input is streamed in BLE-sized chunks while push-to-talk is held, avoiding a giant microphone recording in RAM.
+
+Output is segmented into <=4096-byte ADPCM pieces, then each piece is packetized over BLE and acknowledged before the next piece is sent.
 
 ## Release verification
 
-The Hyper API key exists only on the PC. It is never sent to or stored on the micro:bit.
+Automatic releases are only published after the configured Python syntax checks, Bandit analysis, dependency vulnerability audit, ClamAV scans, and successful micro:bit V2 firmware compilation complete.
 
-Automatic releases are published only after the configured Python checks, dependency audit, antivirus scans, and firmware compilation finish successfully. Each release also includes a generated verification note, scan reports, and SHA-256 checksums.
-
-These automated checks reduce risk; they cannot prove that any software is free of every possible defect or malicious behavior.
+Automated scanning improves release hygiene but cannot mathematically prove that software contains no possible bug or malicious behavior.
