@@ -15,7 +15,12 @@ MicRecorder::MicRecorder(DataSource &source) :
     pendingByte(0)
 {
     source.connect(*this);
-    source.dataWanted(DATASTREAM_WANTED);
+
+    // Do NOT keep the microphone pipeline permanently requested.
+    // On micro:bit V2, DATASTREAM_WANTED propagates all the way to the
+    // NRF52 ADC channel and powers/activates the microphone. Push-to-talk
+    // owns this demand explicitly in start()/stop().
+    source.dataWanted(DATASTREAM_NOT_WANTED);
 }
 
 void MicRecorder::start() {
@@ -27,11 +32,21 @@ void MicRecorder::start() {
     halfNibble = false;
     pendingByte = 0;
     adpcm.reset();
+
+    // Mark ourselves ready before requesting data, because requesting the
+    // stream can activate the ADC immediately.
     recording = true;
+    upstream.dataWanted(DATASTREAM_WANTED);
 }
 
 void MicRecorder::stop() {
     recording = false;
+
+    // Release microphone demand first. This propagates through the splitter
+    // and causes the NRF52 ADC channel to be released/disabled when no other
+    // consumer wants microphone samples.
+    upstream.dataWanted(DATASTREAM_NOT_WANTED);
+
     if (halfNibble) {
         if (!pushByte(pendingByte))
             overflow = true;
