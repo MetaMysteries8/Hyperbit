@@ -47,7 +47,7 @@ jobs:
 
       - name: Inject HyperBit firmware
         run: |
-          rm -f .build/microbit-v2-samples/source/*
+          rm -rf .build/microbit-v2-samples/source/*
           cp firmware/source/* .build/microbit-v2-samples/source/
           cp firmware/codal.json .build/microbit-v2-samples/codal.json
 
