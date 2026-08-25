@@ -141,10 +141,27 @@ static void kickHalfOpenConnection(VoiceBLEService &voice) {
     }
 }
 
+static void suspendDisplayForConnection(bool &displaySuspended) {
+    if (displaySuspended)
+        return;
+    uBit.display.clear();
+    uBit.display.disable();
+    displaySuspended = true;
+}
+
+static void resumeDisplayAfterConnection(bool &displaySuspended) {
+    if (!displaySuspended)
+        return;
+    uBit.display.enable();
+    uBit.display.setDisplayMode(DISPLAY_MODE_GREYSCALE);
+    uBit.display.clear();
+    displaySuspended = false;
+}
+
 int main() {
     uBit.init();
 
-    // Never bit-bang the Wukong RGB LEDs while the SoftDevice is active.
+    // Finish all boot-time peripheral setup before becoming connectable.
     uBit.bleManager.stopAdvertising();
 
     VoiceBLEService voice;
@@ -180,11 +197,11 @@ int main() {
     AliveAnimator animator(uBit, baseLights, rainbow);
     animator.setState(PHYS_DISCONNECTED);
 
-    // Start BLE only after all interrupt-masking RGB writes are finished.
+    // Start BLE only after boot/self-test writes are finished.
     uBit.bleManager.advertise();
 
     bool lastRawConnected = false;
-    bool lastSessionReady = false;
+    bool applicationReady = false;
     bool displaySuspended = false;
     bool pttActive = false;
     bool lastA = false;
@@ -199,71 +216,23 @@ int main() {
     int interruptGraceTicks = 0;
     int animationDivider = 0;
 
-    // Windows may still leave a raw BLE link half-open. Give it a long window,
-    // then evict it and let CODAL advertise again.
+    // Windows can leave a raw BLE link half-open. The 45-second limit covers
+    // Windows' own discovery timeout while guaranteeing eventual recovery.
     int halfOpenTicks = 0;
     const int HALF_OPEN_LIMIT_TICKS = 4500; // ~45 seconds at 10 ms/tick
 
     while (true) {
         bool rawConnected = voice.getConnected();
-        if (!rawConnected)
-            voice.resetSession();
-        bool sessionReady = voice.notificationsReady();
 
         if (rawConnected != lastRawConnected) {
             lastRawConnected = rawConnected;
+            applicationReady = false;
+            halfOpenTicks = 0;
 
-            if (rawConnected && !sessionReady) {
-                // Connection first, personality second. Disable the LED matrix
-                // refresh hardware completely while Windows establishes the NUS
-                // session. No face animation, accelerometer or Wukong traffic.
-                if (!displaySuspended) {
-                    uBit.display.clear();
-                    uBit.display.disable();
-                    displaySuspended = true;
-                }
-            }
-
-            if (!rawConnected) {
-                if (displaySuspended) {
-                    uBit.display.enable();
-                    uBit.display.setDisplayMode(DISPLAY_MODE_GREYSCALE);
-                    uBit.display.clear();
-                    displaySuspended = false;
-                }
-                animator.setState(PHYS_DISCONNECTED);
-            }
-        }
-
-        if (rawConnected && !sessionReady) {
-            if (++halfOpenTicks >= HALF_OPEN_LIMIT_TICKS) {
-                kickHalfOpenConnection(voice);
-                halfOpenTicks = 0;
-            }
-
-            // Deliberately do nothing except service the scheduler/watchdog.
-            uBit.sleep(10);
-            continue;
-        }
-
-        halfOpenTicks = 0;
-
-        if (sessionReady && displaySuspended) {
-            uBit.display.enable();
-            uBit.display.setDisplayMode(DISPLAY_MODE_GREYSCALE);
-            uBit.display.clear();
-            displaySuspended = false;
-        }
-
-        if (interruptGraceTicks > 0)
-            --interruptGraceTicks;
-
-        if (sessionReady != lastSessionReady) {
-            lastSessionReady = sessionReady;
-            if (sessionReady) {
-                animator.setState(PHYS_IDLE);
-                voice.sendControl(HB_EVT_READY, HYPERBIT_PROTOCOL_VERSION, 0, 0);
-                voice.sendControl(HB_EVT_WUKONG_STATUS, baseLights.ok() ? 1 : 0);
+            if (rawConnected) {
+                // Connection first, personality second: shut off the refresh
+                // driver before Windows finishes GATT discovery/CCCD setup.
+                suspendDisplayForConnection(displaySuspended);
             } else {
                 if (pttActive) {
                     recorder.stop();
@@ -271,10 +240,69 @@ int main() {
                 }
                 uBit.audio.deactivateMic();
                 voice.abortTts();
+                resumeDisplayAfterConnection(displaySuspended);
                 animator.setState(PHYS_DISCONNECTED);
                 lastPcState = 255;
             }
         }
+
+        // If a client disables TX notifications after being ready, fall back to
+        // the isolated handshake state rather than continuing a half-session.
+        if (rawConnected && applicationReady && !voice.notificationsReady()) {
+            applicationReady = false;
+            suspendDisplayForConnection(displaySuspended);
+        }
+
+        if (rawConnected && !applicationReady) {
+            if (++halfOpenTicks >= HALF_OPEN_LIMIT_TICKS) {
+                kickHalfOpenConnection(voice);
+                halfOpenTicks = 0;
+                uBit.sleep(10);
+                continue;
+            }
+
+            // HELLO is not sufficient: remain black/peripheral-free until READY
+            // itself is successfully queued to the subscribed TX characteristic.
+            if (!voice.notificationsReady()) {
+                uBit.sleep(10);
+                continue;
+            }
+
+            if (!voice.sendControl(
+                    HB_EVT_READY,
+                    HYPERBIT_PROTOCOL_VERSION,
+                    HYPERBIT_FIRMWARE_REVISION,
+                    HYPERBIT_CAPABILITIES)) {
+                uBit.sleep(10);
+                continue;
+            }
+
+            applicationReady = true;
+            halfOpenTicks = 0;
+            resumeDisplayAfterConnection(displaySuspended);
+            animator.setState(PHYS_IDLE);
+            lastPcState = 255;
+
+            // This status report is intentionally after READY succeeds: Wukong
+            // traffic and personality resume only after the connection barrier.
+            voice.sendControl(HB_EVT_WUKONG_STATUS, baseLights.ok() ? 1 : 0);
+        }
+
+        if (!applicationReady) {
+            // Disconnected animation is allowed; raw-connected handshakes have
+            // already continued above with the matrix physically disabled.
+            if (!rawConnected) {
+                if (++animationDivider >= 3) {
+                    animationDivider = 0;
+                    animator.tick();
+                }
+            }
+            uBit.sleep(10);
+            continue;
+        }
+
+        if (interruptGraceTicks > 0)
+            --interruptGraceTicks;
 
         bool a = uBit.buttonA.isPressed();
         bool b = uBit.buttonB.isPressed();
@@ -301,7 +329,7 @@ int main() {
         lastB = b;
         lastAB = ab;
 
-        if (sessionReady && voice.ttsReady() && !speaking) {
+        if (voice.ttsReady() && !speaking) {
             speaking = true;
             recorder.stop();
             pttActive = false;
@@ -340,14 +368,14 @@ int main() {
         }
 
         uint8_t pcState = voice.pcState();
-        if (sessionReady && !speaking && !pttActive && pcState != lastPcState) {
+        if (!speaking && !pttActive && pcState != lastPcState) {
             lastPcState = pcState;
             animator.setState(visualStateFromPc(pcState));
         }
 
         bool logoTouched = uBit.logo.isPressed();
         bool busy = stateIsBusyForPtt(animator.state());
-        bool logoAllowed = sessionReady && !speaking && (!busy || interruptGraceTicks > 0);
+        bool logoAllowed = !speaking && (!busy || interruptGraceTicks > 0);
         bool logo = logoTouched && logoAllowed;
 
         if (logo && !pttActive) {
@@ -365,7 +393,7 @@ int main() {
         }
 
         if (pttActive) {
-            if (logoTouched && sessionReady) {
+            if (logoTouched && voice.notificationsReady()) {
                 animator.setInputLevel(recorder.level());
                 drainMicPackets(voice, recorder, micSequence, false);
             } else {
