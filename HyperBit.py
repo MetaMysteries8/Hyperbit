@@ -12,7 +12,18 @@ PC_AGENT = ROOT / "pc_agent"
 ENTRYPOINT = PC_AGENT / "agent.py"
 
 if not ENTRYPOINT.is_file():
-    raise SystemExit("pc_agent/agent.py is missing. Extract the whole HyperBit release ZIP before running HyperBit.py.")
+    raise SystemExit(
+        "pc_agent/agent.py is missing. Extract the whole HyperBit release ZIP before running HyperBit.py."
+    )
 
 sys.path.insert(0, str(PC_AGENT))
-runpy.run_path(str(ENTRYPOINT), run_name="__main__")
+
+try:
+    runpy.run_path(str(ENTRYPOINT), run_name="__main__")
+except ModuleNotFoundError as exc:
+    missing = exc.name or "a Python dependency"
+    raise SystemExit(
+        f"Missing Python module: {missing}\n"
+        "Run RUN_HYPERBIT.bat instead; it chooses the Python installation that "
+        "already has HyperBit's dependencies or installs requirements for you."
+    ) from exc
