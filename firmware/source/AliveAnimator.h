@@ -12,7 +12,8 @@ enum HyperBitVisualState {
     PHYS_THINKING = 5,
     PHYS_SPEAKING = 6,
     PHYS_ERROR = 7,
-    PHYS_MUTED = 8
+    PHYS_MUTED = 8,
+    PHYS_CONNECTING = 9
 };
 
 class AliveAnimator {
@@ -38,6 +39,7 @@ class AliveAnimator {
     void clearMatrix();
     void plot(int x, int y, uint8_t value);
     void renderFluid(int ax, int ay, bool dimmer);
+    void renderConnecting();
     void renderListening(uint8_t level);
     void renderThinking();
     void renderSpeaking(uint8_t level);
