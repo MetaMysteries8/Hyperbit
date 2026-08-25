@@ -7,7 +7,7 @@ set "HYPER_API_KEY=sk-hyper-REPLACE_ME"
 REM Optional model. If unavailable, HyperBit asks /v1/models and falls back.
 set "HYPER_MODEL=deepseek-v4-flash"
 
-REM TTS choices: sapi (offline Windows voice) or gtts (online Google voice)
+REM Scanned release TTS backend: offline Windows SAPI.
 set "HYPERBIT_TTS=sapi"
 
 REM Faster-Whisper defaults:

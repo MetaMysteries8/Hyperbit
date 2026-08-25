@@ -41,7 +41,7 @@ set HYPER_MODEL=deepseek-v4-flash
 set HYPERBIT_TTS=sapi
 ```
 
-`HYPERBIT_TTS=sapi` uses offline Windows speech synthesis. `HYPERBIT_TTS=gtts` uses Google TTS and requires internet access.
+The scanned release currently uses offline **Windows SAPI** for TTS. The previous optional gTTS backend was removed after the dependency audit found a known vulnerability in one of its resolved dependencies.
 
 ## 4. Run HyperBit
 

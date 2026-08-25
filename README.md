@@ -1,58 +1,58 @@
 # HyperBit
 
-[![Build HyperBit](https://github.com/MetaMysteries8/Hyperbit/actions/workflows/build-firmware.yml/badge.svg)](https://github.com/MetaMysteries8/Hyperbit/actions/workflows/build-firmware.yml)
+[![Build, Scan & Release HyperBit](https://github.com/MetaMysteries8/Hyperbit/actions/workflows/build-firmware.yml/badge.svg)](https://github.com/MetaMysteries8/Hyperbit/actions/workflows/build-firmware.yml)
 
 A physical voice AI agent with a **BBC micro:bit V2 + ELECFREAKS Wukong** as its wireless body and a **Windows PC** as its main home/brain.
 
-The micro:bit handles push-to-talk, microphone capture, Bluetooth audio, its built-in speaker, the 5×5 display, and Wukong status lighting. The Windows PC handles local speech-to-text, the Charm Hyper agent/tool loop, memory/workspace, TTS, and BLE transport.
+The micro:bit handles push-to-talk, microphone capture, Bluetooth audio, its built-in speaker, the 5×5 display, and Wukong status lighting. The PC handles faster-whisper speech-to-text, the Charm Hyper tool-calling agent, memory/workspace, Windows SAPI TTS, and BLE transport.
 
-## Easiest way to get the compiled firmware
+## Download a ready build
 
-You do **not** need to install a C++ compiler.
+The easiest path is the **Releases** page. A release is created automatically only after the configured build/security gates succeed.
 
-1. Open the **Actions** tab.
-2. Open **Build HyperBit**.
-3. Use the newest successful run, or click **Run workflow** to build it manually.
-4. Download the **HyperBit-build** artifact.
-5. Inside it:
-   - `HyperBit.hex` — flash this directly to the micro:bit V2.
-   - `HyperBit-Windows-PC.zip` — the complete Windows project with that compiled HEX already inside it.
+Download `HyperBit-release.zip`. It contains:
 
-GitHub Actions compiles the firmware using Lancaster University's official `microbit-v2-samples` CODAL build system and the GNU Arm Embedded toolchain.
+- `HyperBit.hex` — compiled micro:bit V2 firmware.
+- `HyperBit.py` — simple PC launcher.
+- `pc_agent/` — supporting Python modules.
+- `requirements.txt` and `config.example.cmd`.
+- `HI.md`, `INSTRUCTIONS.md`, and `INFO.md`.
+- flashing helpers.
+- `SECURITY_SCAN.md`.
+
+The release page also attaches SHA-256 checksums and raw security reports.
+
+## Release gates
+
+Before an automatic release is published, GitHub Actions must successfully complete:
+
+- Python syntax/bytecode compilation.
+- Bandit static analysis.
+- pip-audit dependency vulnerability checking.
+- ClamAV source scanning.
+- GNU Arm/CODAL firmware compilation.
+- ClamAV scanning of the final firmware and ZIP.
+- SHA-256 checksum generation.
+
+These checks reduce risk but cannot prove the absence of every possible defect or malicious behavior.
 
 ## Flashing
 
-Plug the **micro:bit itself** into the PC over USB. The Wukong is an expansion board and is not separately flashed.
+Plug the **micro:bit itself** into your PC over USB and copy `HyperBit.hex` to the `MICROBIT` drive. The Wukong is an expansion board and is not separately flashed.
 
-Either drag `HyperBit.hex` onto the `MICROBIT` drive or, from the full Windows package, run:
+After flashing, unplug USB and use the Wukong battery.
 
-```text
-FLASH_FIRMWARE.bat
-```
+## Windows setup
 
-After flashing, disconnect USB and power the micro:bit from the Wukong battery.
-
-## Windows agent setup
-
-From `HyperBit-Windows-PC.zip`:
-
-1. Run `SETUP_PC.bat`.
-2. Edit `config.cmd` and set your Hyper API key.
-3. Run `TEST_BRAIN.bat`.
-4. Run `RUN_AGENT.bat`.
-
-Example config:
+From the release ZIP:
 
 ```bat
-set "HYPER_API_KEY=sk-hyper-REPLACE_ME"
-set "HYPER_MODEL=deepseek-v4-flash"
-set "HYPERBIT_TTS=sapi"
+py -3 -m pip install -r requirements.txt
+set HYPER_API_KEY=sk-hyper-your-key
+py -3 HyperBit.py
 ```
 
-TTS choices currently included:
-
-- `sapi` — offline Windows speech synthesis.
-- `gtts` — Google TTS; internet required.
+The scanned release currently uses **Windows SAPI** for offline TTS.
 
 ## Physical controls
 
@@ -63,7 +63,7 @@ TTS choices currently included:
 - **Wukong battery:** wireless power.
 - **Wukong blue base LEDs:** connection/agent state.
 
-Current Wukong states:
+Wukong state lighting:
 
 - breathing — PC disconnected
 - dim — connected / idle
@@ -71,8 +71,6 @@ Current Wukong states:
 - brighter — transcribing
 - bright — thinking
 - full — speaking / error
-
-The four P16 Rainbow LEDs are intentionally left unused in the first hardware build so NeoPixel timing does not complicate BLE audio debugging.
 
 ## Architecture
 
@@ -88,7 +86,7 @@ Windows PC
   faster-whisper
   Charm Hyper + tools
   memory/workspace
-  SAPI or gTTS
+  Windows SAPI
           |
       IMA ADPCM
           |
@@ -97,14 +95,4 @@ Windows PC
 micro:bit V2 speaker
 ```
 
-See [`PROTOCOL.md`](PROTOCOL.md) for the BLE protocol and [`README_WINDOWS.md`](README_WINDOWS.md) for the longer Windows setup notes.
-
-## Firmware build details
-
-The Action checks out this repository, installs the Arm toolchain, clones `lancaster-university/microbit-v2-samples`, replaces its sample source with `firmware/source/`, and runs:
-
-```bash
-python3 build.py
-```
-
-The resulting `MICROBIT.hex` becomes `HyperBit.hex` in the downloadable artifact.
+See `PROTOCOL.md` for the BLE protocol and `README_WINDOWS.md` for more setup/build details.
