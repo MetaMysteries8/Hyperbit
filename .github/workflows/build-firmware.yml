@@ -138,7 +138,7 @@ jobs:
 
           - Python bytecode/syntax compilation check.
           - Bandit static analysis for medium-or-higher severity findings with medium-or-higher confidence.
-          - `pip-audit` dependency vulnerability audit.
+          - pip-audit dependency vulnerability audit.
           - ClamAV scan of the HyperBit Python and firmware source.
           - Successful CODAL/GNU Arm compilation of the micro:bit V2 firmware.
           - ClamAV scan of the final release ZIP before publication.
@@ -169,11 +169,11 @@ jobs:
           cat > dist/RELEASE_NOTES.md <<EOF
           # HyperBit automated build ${GITHUB_RUN_NUMBER}
 
-          Built from commit `${GITHUB_SHA}`.
+          Built from commit ${GITHUB_SHA}.
 
           ## Downloads
 
-          - **HyperBit-release.zip** — recommended package. Contains the compiled firmware, `HyperBit.py`, supporting Python modules, requirements/config, `HI.md`, `INSTRUCTIONS.md`, `INFO.md`, flashing helpers, and the release verification note.
+          - **HyperBit-release.zip** — recommended package. Contains the compiled firmware, HyperBit.py, supporting Python modules, requirements/config, HI.md, INSTRUCTIONS.md, INFO.md, flashing helpers, and the release verification note.
           - **HyperBit.hex** — firmware only for a BBC micro:bit V2.
           - **CHECKSUMS.sha256** — SHA-256 checksums for the firmware and ZIP.
 
@@ -192,7 +192,7 @@ jobs:
             dist/HyperBit.hex
             dist/HyperBit-release.zip
             dist/CHECKSUMS.sha256
-            dist/SECURITY*.txt
+            dist/release/SECURITY_SCAN.md
             dist/security-*.txt
             dist/security-*.json
 
