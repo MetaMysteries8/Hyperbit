@@ -6,6 +6,8 @@
 #include "WukongRainbow.h"
 #include "AliveAnimator.h"
 #include "ImaAdpcm.h"
+#include "ble.h"
+#include "ble_hci.h"
 
 using namespace codal;
 MicroBit uBit;
@@ -132,11 +134,23 @@ static bool stateIsBusyForPtt(uint8_t state) {
            state == PHYS_SPEAKING;
 }
 
+static void kickHalfOpenConnection(VoiceBLEService &voice) {
+    microbit_gaphandle_t handle = voice.getConnectionHandle();
+    if (handle != BLE_CONN_HANDLE_INVALID) {
+        // Windows occasionally establishes the radio link and then stalls while
+        // enumerating GATT. The micro:bit has one peripheral connection slot,
+        // so evict that unusable session and let CODAL's onDisconnect() restart
+        // advertising automatically.
+        sd_ble_gap_disconnect(handle, BLE_HCI_REMOTE_USER_TERMINATED_CONNECTION);
+    }
+}
+
 int main() {
     uBit.init();
 
     VoiceBLEService voice;
     uBit.bleManager.setTransmitPower(7);
+    uBit.bleManager.setAdvertiseOnDisconnect(true);
     uBit.bleManager.stopAdvertising();
     uBit.bleManager.advertise();
 
@@ -159,9 +173,6 @@ int main() {
     WukongLights baseLights(uBit.i2c);
     WukongRainbow rainbow(uBit.io.P16);
 
-    // Keep the boot diagnostic the user liked: W means the base-light I2C
-    // controller did not answer; H means Wukong was detected. The animation
-    // takes over immediately afterward instead of hanging on the letter.
     bool wukongBaseOk = baseLights.selfTest();
     rainbow.selfTest();
     uBit.display.print(wukongBaseOk ? "H" : "W");
@@ -170,7 +181,7 @@ int main() {
     AliveAnimator animator(uBit, baseLights, rainbow);
     animator.setState(PHYS_DISCONNECTED);
 
-    bool lastConnected = false;
+    bool lastSessionReady = false;
     bool pttActive = false;
     bool lastA = false;
     bool lastB = false;
@@ -181,20 +192,37 @@ int main() {
     uint8_t micSequence = 0;
     ImaAdpcmState ttsDecoder;
 
-    // About three seconds. While the agent is busy, push-to-talk is only
-    // accepted during this grace window after A has interrupted the old task.
     int interruptGraceTicks = 0;
     int animationDivider = 0;
 
+    // Main loop is ~10 ms/tick. If Windows owns the physical BLE link for ten
+    // seconds without subscribing to HyperBit's MIC + CONTROL notifications,
+    // it is a broken/half-open GATT connection and gets evicted.
+    int halfOpenTicks = 0;
+    const int HALF_OPEN_LIMIT_TICKS = 1000;
+
     while (true) {
-        bool connected = voice.getConnected();
+        bool rawConnected = voice.getConnected();
+        bool sessionReady = voice.notificationsReady();
+
+        if (rawConnected && !sessionReady) {
+            if (++halfOpenTicks >= HALF_OPEN_LIMIT_TICKS) {
+                kickHalfOpenConnection(voice);
+                halfOpenTicks = 0;
+                animator.setState(PHYS_DISCONNECTED);
+            }
+        } else {
+            halfOpenTicks = 0;
+        }
 
         if (interruptGraceTicks > 0)
             --interruptGraceTicks;
 
-        if (connected != lastConnected) {
-            lastConnected = connected;
-            if (connected) {
+        // Only call HyperBit truly connected after GATT discovery completed and
+        // Windows subscribed to both notification characteristics.
+        if (sessionReady != lastSessionReady) {
+            lastSessionReady = sessionReady;
+            if (sessionReady) {
                 animator.setState(PHYS_IDLE);
                 voice.sendControl(HB_EVT_READY);
                 voice.sendControl(HB_EVT_WUKONG_STATUS, baseLights.ok() ? 1 : 0);
@@ -220,8 +248,6 @@ int main() {
             voice.sendControl(HB_EVT_MUTE_CHANGED, muted ? 1 : 0);
         } else if (!ab) {
             if (a && !lastA) {
-                // A is a real interruption: stop playback, tell the PC to
-                // discard the in-flight answer, and briefly arm busy-state PTT.
                 voice.abortTts();
                 voice.sendControl(HB_EVT_CANCEL);
                 interruptGraceTicks = 300;
@@ -238,7 +264,7 @@ int main() {
         lastB = b;
         lastAB = ab;
 
-        if (connected && voice.ttsReady() && !speaking) {
+        if (sessionReady && voice.ttsReady() && !speaking) {
             speaking = true;
             recorder.stop();
             pttActive = false;
@@ -263,8 +289,6 @@ int main() {
 
             if (!completed) {
                 voice.sendControl(HB_EVT_CANCEL);
-                // Playback can only return early through A, so let the user
-                // immediately hold the gold logo to replace the interrupted reply.
                 interruptGraceTicks = 300;
             }
 
@@ -273,21 +297,18 @@ int main() {
         }
 
         uint8_t pcState = voice.pcState();
-        if (connected && !speaking && !pttActive && pcState != lastPcState) {
+        if (sessionReady && !speaking && !pttActive && pcState != lastPcState) {
             lastPcState = pcState;
             animator.setState(visualStateFromPc(pcState));
         }
 
-        // V2 GOLD LOGO = push-to-talk. It works freely while idle. If HyperBit
-        // is busy, A must have just interrupted the old operation first.
         bool logoTouched = uBit.logo.isPressed();
         bool busy = stateIsBusyForPtt(animator.state());
-        bool logoAllowed = connected && !speaking && (!busy || interruptGraceTicks > 0);
+        bool logoAllowed = sessionReady && !speaking && (!busy || interruptGraceTicks > 0);
         bool logo = logoTouched && logoAllowed;
 
         if (logo && !pttActive) {
             if (busy) {
-                // Consume the grace window and reinforce cancellation on the PC.
                 interruptGraceTicks = 0;
                 voice.sendControl(HB_EVT_CANCEL);
             }
@@ -301,7 +322,7 @@ int main() {
         }
 
         if (pttActive) {
-            if (logoTouched) {
+            if (logoTouched && sessionReady) {
                 animator.setInputLevel(recorder.level());
                 drainMicPackets(voice, recorder, micSequence, false);
             } else {
@@ -312,7 +333,6 @@ int main() {
             }
         }
 
-        // ~33 fps visual loop without blocking the BLE/audio loop.
         if (++animationDivider >= 3) {
             animationDivider = 0;
             if (pttActive)
