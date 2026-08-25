@@ -71,9 +71,8 @@ void AliveAnimator::plot(int x, int y, uint8_t value) {
 void AliveAnimator::renderFluid(int ax, int ay, bool dimmer) {
     clearMatrix();
 
-    // Empirically match the physical micro:bit V2 orientation: with the board
-    // upright (logo at the top), gravity must pull pixels toward display row 4.
-    // The previous -ay sign made the liquid climb upward.
+    // Match the physical micro:bit V2 orientation: with the board upright
+    // (gold logo at the top), gravity must pull the liquid toward display row 4.
     int gx = clampi(ax / 52, -20, 20);
     int gy = clampi(ay / 52, -20, 20);
 
@@ -226,12 +225,11 @@ void AliveAnimator::updateBodyGlow(uint8_t level) {
 }
 
 void AliveAnimator::renderWukong(int ax, int ay, uint8_t level) {
-    // IMPORTANT: intentionally no live P16 WS2812 writes here.
-    // WukongRainbow::show() currently uses a bit-banged routine wrapped in
-    // __disable_irq()/__enable_irq(). That is unsafe while Nordic's SoftDevice
-    // is advertising/connected and can provoke micro:bit panic 070 (SoftDevice
-    // assertion). The four RGB LEDs are set once before BLE advertising begins.
-    // The 8 blue I2C base LEDs remain fully animated by updateBodyGlow().
+    // Intentionally no live P16 WS2812 writes here. WukongRainbow::show()
+    // currently masks IRQs around a bit-banged transfer, which is unsafe while
+    // Nordic's BLE SoftDevice is active and can provoke panic 070. The four RGB
+    // LEDs are set once before BLE advertising begins; the 8 blue I2C base LEDs
+    // remain animated here without interrupt masking.
     (void)ax;
     (void)ay;
     (void)level;
