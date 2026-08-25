@@ -70,11 +70,26 @@ class HyperBitBLE:
         self._tts_done_ok = True
         self._tx_lock = asyncio.Lock()
 
-    async def _find(self):
+    @staticmethod
+    def _looks_like_microbit(name: str) -> bool:
+        n = name.lower()
+        return "micro:bit" in n or "microbit" in n
+
+    async def _find_candidates(self):
+        """Return BLE devices worth validating with the HyperBit HELLO handshake.
+
+        NUS is intentionally a standard/shared service, so merely advertising the
+        NUS UUID does not prove a device is HyperBit. Explicit address/name hints
+        take precedence. Otherwise BBC micro:bit-looking names are tried before
+        generic NUS peripherals, and every returned candidate may be validated.
+        """
         print("[ble] scanning 10 seconds...")
         found = await BleakScanner.discover(timeout=10.0, return_adv=True)
-        candidates = []
         seen = []
+        exact_address = []
+        name_matches = []
+        microbits = []
+        generic_nus = []
 
         for _key, pair in found.items():
             device, adv = pair
@@ -83,17 +98,42 @@ class HyperBitBLE:
             seen.append((name or "<unnamed>", device.address, service_uuids))
 
             if self.address and device.address.lower() == self.address.lower():
-                return device
-            if self.name_hint and self.name_hint.lower() in name.lower():
-                candidates.append(device)
+                exact_address.append(device)
                 continue
-            if SERVICE_UUID.lower() in service_uuids:
-                candidates.append(device)
-                continue
-            if not self.name_hint and ("micro:bit" in name.lower() or "microbit" in name.lower()):
-                candidates.append(device)
 
-        if not candidates:
+            if self.name_hint:
+                if self.name_hint.lower() in name.lower():
+                    name_matches.append(device)
+                continue
+
+            if self._looks_like_microbit(name):
+                microbits.append(device)
+                continue
+
+            if SERVICE_UUID.lower() in service_uuids:
+                generic_nus.append(device)
+
+        if self.address:
+            candidates = exact_address
+        elif self.name_hint:
+            candidates = name_matches
+        else:
+            # A standard NUS peripheral is not necessarily HyperBit. Prefer the
+            # micro:bit identity, then validate any remaining NUS devices too.
+            candidates = microbits + generic_nus
+
+        # Windows can surface the same peripheral through multiple discovery
+        # records. Keep candidate order while deduplicating by address.
+        unique = []
+        used_addresses = set()
+        for device in candidates:
+            key = device.address.lower()
+            if key in used_addresses:
+                continue
+            used_addresses.add(key)
+            unique.append(device)
+
+        if not unique:
             print("[ble] no HyperBit candidate matched. Devices seen by Windows:")
             if not seen:
                 print("  (none)")
@@ -105,9 +145,10 @@ class HyperBitBLE:
                 "send that block back so the firmware/advertising can be diagnosed."
             )
 
-        device = candidates[0]
-        print(f"[ble] selected {device.name or 'micro:bit'} ({device.address})")
-        return device
+        print(f"[ble] {len(unique)} candidate(s) will be validated with HyperBit HELLO")
+        for index, device in enumerate(unique, 1):
+            print(f"  [{index}] {device.name or '<unnamed>'} ({device.address})")
+        return unique
 
     async def _disconnect_partial(self):
         if not self.client:
@@ -142,29 +183,26 @@ class HyperBitBLE:
         response = "write-without-response" not in props
         await self.client.write_gatt_char(self.rx_char, payload, response=response)
 
-    async def connect(self):
-        # Scan once and preserve the concrete Windows BLEDevice. A failed service
-        # discovery can leave the board connected and therefore not advertising.
-        dev = await self._find()
-
+    async def _try_candidate(self, dev, candidate_index: int, candidate_count: int):
         attempts = [
             (True, "Windows cached services"),
             (False, "fresh/uncached services after firmware recovery"),
             (False, "fresh/uncached services retry"),
         ]
         last_error: BaseException | None = None
+        looks_like_microbit = self._looks_like_microbit(dev.name or "")
 
         for attempt, (use_cache, label) in enumerate(attempts, 1):
             if attempt > 1:
                 print(
-                    f"[ble] retry {attempt}/{len(attempts)}: reusing {dev.address}; "
-                    f"waiting {GATT_RECOVERY_WAIT_SECONDS:.0f}s for firmware BLE recovery..."
+                    f"[ble] retry {attempt}/{len(attempts)} for {dev.address}: "
+                    f"waiting {GATT_RECOVERY_WAIT_SECONDS:.0f}s for BLE recovery..."
                 )
                 await asyncio.sleep(GATT_RECOVERY_WAIT_SECONDS)
 
             print(
-                f"[ble] connecting to {dev.name or 'micro:bit'} ({dev.address}) "
-                f"using {label}"
+                f"[ble] candidate {candidate_index}/{candidate_count}: connecting to "
+                f"{dev.name or '<unnamed>'} ({dev.address}) using {label}"
             )
 
             self.client = BleakClient(
@@ -184,30 +222,41 @@ class HyperBitBLE:
                         await self._disconnect_partial()
                         continue
 
-                    print("[ble] services present on connected device:")
-                    for service in self.client.services:
-                        print(" ", service.uuid)
+                    print("[ble] candidate has no usable Nordic UART Service; moving on")
                     await self._disconnect_partial()
-                    raise RuntimeError("The board connected, but Nordic UART Service is missing.")
+                    return False, RuntimeError("Nordic UART Service is missing")
 
                 self.tx_char, self.rx_char = chars
                 self._loop = asyncio.get_running_loop()
                 self._ready.clear()
 
-                # Subscribe first, then explicitly tell firmware that the NUS
-                # application session is ready. The firmware does not inspect
-                # CCCDs during Windows service discovery anymore.
+                # NUS is shared by many products. Subscription + protocol HELLO is
+                # the actual HyperBit identity check.
                 await self.client.start_notify(self.tx_char, self._nus_notify)
                 await self._write_frame(bytes([FRAME_HELLO, PROTOCOL_VERSION]))
 
                 try:
                     await asyncio.wait_for(self._ready.wait(), timeout=HELLO_TIMEOUT_SECONDS)
                 except asyncio.TimeoutError as exc:
-                    raise RuntimeError("Bluetooth connected, but HyperBit HELLO/READY handshake timed out") from exc
+                    last_error = RuntimeError(
+                        "NUS connected, but this device did not answer HyperBit HELLO"
+                    )
+                    await self._disconnect_partial()
 
-                print(f"[ble] connected over Nordic UART Service; HyperBit protocol v{PROTOCOL_VERSION}")
+                    # An unrelated generic NUS device is definitively not worth
+                    # spending two 35s + recovery retries on. A named micro:bit
+                    # can still be the right board with a transient BLE problem.
+                    if not looks_like_microbit and not self.address and not self.name_hint:
+                        print("[ble] generic NUS device did not answer HyperBit HELLO; moving on")
+                        return False, last_error
+                    continue
+
+                print(
+                    f"[ble] HyperBit validated and connected over Nordic UART Service; "
+                    f"protocol v{PROTOCOL_VERSION}"
+                )
                 await self.set_state(STATE_IDLE)
-                return
+                return True, None
 
             except (TimeoutError, asyncio.TimeoutError) as exc:
                 last_error = exc
@@ -222,11 +271,26 @@ class HyperBitBLE:
                 print(f"[ble] connection attempt failed: {type(exc).__name__}: {exc}")
                 await self._disconnect_partial()
 
+        return False, last_error
+
+    async def connect(self):
+        candidates = await self._find_candidates()
+        last_error: BaseException | None = None
+
+        for index, dev in enumerate(candidates, 1):
+            ok, error = await self._try_candidate(dev, index, len(candidates))
+            if ok:
+                return
+            if error is not None:
+                last_error = error
+            if index < len(candidates):
+                print("[ble] candidate did not validate as HyperBit; trying next candidate...")
+
         raise RuntimeError(
-            "Windows found the micro:bit but could not establish the Nordic UART Service session "
-            "after three attempts. The firmware now disables the LED matrix and all peripheral "
-            "activity during the raw connection window, so repeated failure here points at the "
-            "BLE/security/runtime layer rather than the fluid animation."
+            "Windows found Bluetooth candidates but none established a usable HyperBit NUS "
+            "HELLO/READY session. Firmware now disables the LED matrix and all peripheral "
+            "activity during the raw connection window, so a timeout on a BBC micro:bit "
+            "candidate points at the BLE/security/runtime layer rather than fluid rendering."
         ) from last_error
 
     def _nus_notify(self, _sender, data: bytearray):
@@ -271,8 +335,8 @@ class HyperBitBLE:
         elif code == EVT_READY:
             if a != PROTOCOL_VERSION:
                 print(f"[device] protocol mismatch: firmware={a}, pc={PROTOCOL_VERSION}")
-            else:
-                print(f"[device] firmware ready; NUS transport protocol v{a}")
+                return
+            print(f"[device] firmware ready; NUS transport protocol v{a}")
             self._loop.call_soon_threadsafe(self._ready.set)
 
         elif code == EVT_CANCEL:
@@ -305,7 +369,14 @@ class HyperBitBLE:
     def clear_cancel(self):
         self._cancel.clear()
 
-    async def _write_control(self, code: int, a: int = 0, b: int = 0, c: int = 0, include_all: bool = False):
+    async def _write_control(
+        self,
+        code: int,
+        a: int = 0,
+        b: int = 0,
+        c: int = 0,
+        include_all: bool = False,
+    ):
         if include_all:
             payload = bytes([FRAME_CONTROL, code & 0xFF, a & 0xFF, b & 0xFF, c & 0xFF])
         elif c:
