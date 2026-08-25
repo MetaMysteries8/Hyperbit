@@ -59,6 +59,19 @@ void VoiceBLEService::resetSession() {
     abortTts();
 }
 
+void VoiceBLEService::onConnect(const microbit_ble_evt_t *p_ble_evt) {
+    (void)p_ble_evt;
+    // Never inherit application state across a fast reconnect.
+    resetSession();
+}
+
+void VoiceBLEService::onDisconnect(const microbit_ble_evt_t *p_ble_evt) {
+    (void)p_ble_evt;
+    // Reset immediately in BLE event context instead of waiting for main-loop
+    // polling to notice the disconnect.
+    resetSession();
+}
+
 void VoiceBLEService::abortTts() {
     ttsReceiving = false;
     ttsReadyFlag = false;
@@ -69,7 +82,7 @@ void VoiceBLEService::abortTts() {
 }
 
 bool VoiceBLEService::sendControl(uint8_t code, uint8_t a, uint8_t b, uint8_t c) {
-    if (!getConnected() || !sessionReadyFlag)
+    if (!getConnected() || !sessionReadyFlag || !notifyChrValueEnabled(HB_NUS_TX))
         return false;
 
     uint8_t frame[5] = {HB_FRAME_CONTROL, code, a, b, c};
@@ -77,7 +90,7 @@ bool VoiceBLEService::sendControl(uint8_t code, uint8_t a, uint8_t b, uint8_t c)
 }
 
 bool VoiceBLEService::sendMic(uint8_t seq, const uint8_t *data, int len) {
-    if (!getConnected() || !sessionReadyFlag || !data || len < 0)
+    if (!getConnected() || !sessionReadyFlag || !notifyChrValueEnabled(HB_NUS_TX) || !data || len < 0)
         return false;
 
     if (len > HYPERBIT_NUS_AUDIO_PAYLOAD)
@@ -102,16 +115,23 @@ void VoiceBLEService::onDataWritten(const microbit_ble_evt_write_t *params) {
     const uint8_t frameType = data[0];
 
     if (frameType == HB_FRAME_HELLO) {
-        if (len >= 2 && data[1] == HYPERBIT_PROTOCOL_VERSION)
-            sessionReadyFlag = true;
-        else
-            sessionReadyFlag = false;
+        // HELLO is the first application write. The PC must already have enabled
+        // TX notifications, otherwise READY could never be delivered. This also
+        // makes an accidental write from a generic NUS client insufficient to
+        // enter the interactive state.
+        sessionReadyFlag = (
+            len >= 2 &&
+            data[1] == HYPERBIT_PROTOCOL_VERSION &&
+            notifyChrValueEnabled(HB_NUS_TX)
+        );
+        if (!sessionReadyFlag)
+            abortTts();
         return;
     }
 
     // Ignore application data until the PC has completed the explicit HELLO
     // handshake. A raw BLE connection alone is not a HyperBit session.
-    if (!sessionReadyFlag)
+    if (!sessionReadyFlag || !notifyChrValueEnabled(HB_NUS_TX))
         return;
 
     if (frameType == HB_FRAME_TTS) {
