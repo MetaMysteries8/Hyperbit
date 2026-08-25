@@ -10,6 +10,7 @@ MicRecorder::MicRecorder(DataSource &source) :
     overflow(false),
     head(0),
     tail(0),
+    audioLevel(0),
     sampleCount(0),
     halfNibble(false),
     pendingByte(0)
@@ -17,9 +18,6 @@ MicRecorder::MicRecorder(DataSource &source) :
     source.connect(*this);
 
     // Do NOT keep the microphone pipeline permanently requested.
-    // On micro:bit V2, DATASTREAM_WANTED propagates all the way to the
-    // NRF52 ADC channel and powers/activates the microphone. Push-to-talk
-    // owns this demand explicitly in start()/stop().
     source.dataWanted(DATASTREAM_NOT_WANTED);
 }
 
@@ -27,25 +25,21 @@ void MicRecorder::start() {
     recording = false;
     head = 0;
     tail = 0;
+    audioLevel = 0;
     sampleCount = 0;
     overflow = false;
     halfNibble = false;
     pendingByte = 0;
     adpcm.reset();
 
-    // Mark ourselves ready before requesting data, because requesting the
-    // stream can activate the ADC immediately.
     recording = true;
     upstream.dataWanted(DATASTREAM_WANTED);
 }
 
 void MicRecorder::stop() {
     recording = false;
-
-    // Release microphone demand first. This propagates through the splitter
-    // and causes the NRF52 ADC channel to be released/disabled when no other
-    // consumer wants microphone samples.
     upstream.dataWanted(DATASTREAM_NOT_WANTED);
+    audioLevel = 0;
 
     if (halfNibble) {
         if (!pushByte(pendingByte))
@@ -89,8 +83,13 @@ int MicRecorder::pullRequest() {
     if (!recording)
         return DEVICE_OK;
 
+    int peak = 0;
+
     for (int i = 0; i < b.length(); ++i) {
         int8_t s8 = (int8_t)b[i];
+        int mag = s8 < 0 ? -((int)s8) : (int)s8;
+        if (mag > peak) peak = mag;
+
         int16_t sample = ((int16_t)s8) << 8;
         uint8_t nibble = adpcm.encode(sample);
 
@@ -106,6 +105,14 @@ int MicRecorder::pullRequest() {
         if (sampleCount < 0x7FFFFF)
             ++sampleCount;
     }
+
+    int mapped = peak * 2;
+    if (mapped > 255) mapped = 255;
+    // Fast attack, slower release keeps the blob readable instead of flickering.
+    if (mapped > audioLevel)
+        audioLevel = (uint8_t)mapped;
+    else
+        audioLevel = (uint8_t)((audioLevel * 3 + mapped) / 4);
 
     return DEVICE_OK;
 }
