@@ -76,7 +76,7 @@ public:
     // The application session becomes ready only after the PC has subscribed to
     // NUS TX and explicitly written a HELLO frame to NUS RX. We intentionally do
     // not inspect CCCDs while Windows is still discovering GATT.
-    bool notificationsReady() const { return getConnected() && sessionReadyFlag; }
+    bool notificationsReady() { return getConnected() && sessionReadyFlag; }
     void resetSession();
 
     bool ttsReady() const { return ttsReadyFlag; }
