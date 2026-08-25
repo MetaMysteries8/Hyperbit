@@ -36,7 +36,7 @@ class WindowsSapiTTS:
         if os.name != "nt":
             raise RuntimeError("Windows SAPI TTS requires Windows.")
 
-        text = " ".join(text.split())[:320]
+        text = " ".join(text.split())[:600]
         with tempfile.TemporaryDirectory(prefix="hyperbit-tts-") as td:
             td = Path(td)
             txt = td / "say.txt"
@@ -67,7 +67,10 @@ $s.Dispose()
                 raise RuntimeError(f"SAPI TTS failed: {proc.stderr[-500:]}")
             pcm, src_rate = _wav_to_mono_int16(wav)
 
-        pcm = resample_int16(pcm, src_rate, target_rate)[: target_rate * 5]
+        pcm = resample_int16(pcm, src_rate, target_rate)
+        # BLE playback is segmented, so the micro:bit never needs this entire
+        # response in RAM. Keep only a generous sanity cap on the PC side.
+        pcm = pcm[: target_rate * 20]
         return encode_ima_adpcm(pcm)
 
 
