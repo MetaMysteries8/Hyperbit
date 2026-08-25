@@ -1,10 +1,14 @@
 # HyperBit Instructions
 
-## 1. Flash the firmware
+## 1. Use one release as a matched pair
 
-Plug the **micro:bit V2 itself** into the Windows PC over USB.
+Download the latest `HyperBit-release.zip` and extract the **whole** ZIP. Use the `HyperBit.hex` and PC files from that same release together.
 
-The release ZIP already contains `HyperBit.hex` at its root. Double-click:
+The PC agent now validates the firmware revision during HELLO/READY, so accidentally mixing a new PC agent with an old flashed HEX produces an explicit stale-firmware error instead of a mysterious connection failure.
+
+## 2. Flash the firmware
+
+Plug the **micro:bit V2 itself** into the Windows PC over USB, then double-click:
 
 ```text
 FLASH_FIRMWARE.bat
@@ -12,13 +16,47 @@ FLASH_FIRMWARE.bat
 
 The Wukong is not flashed separately. The firmware runs on the micro:bit and directly controls Wukong hardware.
 
-At boot, the Wukong should visibly self-test:
+At boot, Wukong should visibly self-test:
+
 - its eight blue base LEDs change state,
 - its four Rainbow LEDs on P16 flash red, green, blue, then white.
 
-If those do not happen, tell us; that specifically means the Wukong driver needs attention.
+If that self-test does not happen, diagnose Wukong/power before the AI stack.
 
-## 2. Configure the PC agent
+## 3. Test Bluetooth before configuring the AI
+
+Double-click:
+
+```text
+TEST_BLE.bat
+```
+
+This mode requires **no Hyper API key**. It tests only:
+
+- Windows BLE discovery,
+- Nordic UART Service discovery,
+- TX notification subscription,
+- HyperBit HELLO/READY,
+- protocol + firmware revision + capability validation,
+- a two-second post-handshake stability window.
+
+A current board should report protocol v2 and firmware revision r3 or newer.
+
+During the raw connection/handshake window the 5×5 display intentionally goes **black**. Firmware disables the matrix refresh driver and does no animation, accelerometer, Wukong, microphone, speaker, or button work until READY has been successfully queued. That is deliberate connection isolation, not a frozen fluid renderer.
+
+If `TEST_BLE.bat` fails, copy the `[ble]` output. You can also target one board explicitly:
+
+```text
+RUN_HYPERBIT.bat --ble-test --address E7:3F:04:AA:4A:AC
+```
+
+or by a name substring:
+
+```text
+RUN_HYPERBIT.bat --ble-test --name "BBC micro:bit"
+```
+
+## 4. Configure the PC agent
 
 The easiest launcher is:
 
@@ -26,13 +64,15 @@ The easiest launcher is:
 RUN_HYPERBIT.bat
 ```
 
-On the first run it creates `config.cmd` from `config.example.cmd` if needed. Put your Hyper API key in `config.cmd` and run the launcher again.
+On the first normal run it creates `config.cmd` from `config.example.cmd` if needed. Put your Hyper API key in `config.cmd`, save it, then run the launcher again.
 
-The launcher also avoids the common Windows problem where `py -3`, `python`, and `python3` point at different Python installations.
+Keep `config.cmd` private; it is intentionally excluded from the repository and release assets.
 
-## 3. Physical controls
+The launcher checks for the required Python modules, including faster-whisper, and installs `requirements.txt` if needed. The first faster-whisper use may download the configured model.
 
-- **Hold the V2 gold logo at the top:** microphone hardware turns ON and speech is sent in small BLE packets.
+## 5. Physical controls
+
+- **Hold the V2 gold logo at the top:** microphone hardware turns ON and compressed speech streams to the PC.
 - **Release the gold logo:** microphone hardware turns OFF and the utterance ends.
 - **A:** cancel the current response; while speaking, interrupt playback.
 - **B:** replay the last spoken answer.
@@ -40,30 +80,35 @@ The launcher also avoids the common Windows problem where `py -3`, `python`, and
 
 The microphone is deliberately deactivated whenever the gold logo is not being held.
 
-## 4. Wukong behavior
+## 6. Physical state display
 
-HyperBit uses both:
-- Wukong's eight programmable blue base LEDs through its I2C controller.
-- Wukong's four Rainbow/NeoPixel LEDs on P16.
+HyperBit uses both parts of Wukong's lighting hardware:
 
-The LEDs show connection and agent state such as idle, listening, uploading, thinking, speaking, muted, and error.
+- eight blue base LEDs over Wukong's I2C controller,
+- four Rainbow/NeoPixel LEDs on P16 using CODAL's hardware-PWM path.
 
-## 5. BLE connection behavior
+The 5×5 matrix and Wukong lights show disconnected, idle, listening, uploading, transcribing, thinking, speaking, muted, and error states. Rainbow state updates do not use the old interrupt-masking bit-banger.
 
-HyperBit now uses the conventional **Nordic UART Service (NUS)** UUID layout instead of the older HyperBit-specific three-characteristic service.
+## 7. Audio transport
 
-While Windows is establishing the raw BLE/NUS session, the firmware deliberately disables the micro:bit 5x5 display refresh driver and pauses animation, accelerometer reads, Wukong updates, microphone work, and speaker PWM. A briefly blank 5x5 during connection is therefore intentional; the face comes back after the HyperBit HELLO/READY handshake completes or the connection drops.
+HyperBit does not store a whole conversation-sized audio file on the micro:bit.
 
-## 6. Audio size / chunking
+Microphone audio is streamed as tiny BLE packets while the logo is held through a 512-byte ring buffer. TTS is split by the PC into at most 512 ADPCM bytes per acknowledged segment, with each segment further divided into <=20-byte NUS frames.
 
-HyperBit does not try to shove a large audio file into the micro:bit.
+Audio is 8 kHz mono IMA ADPCM.
 
-Microphone audio is streamed as tiny BLE packets while the logo is held.
+## 8. Disconnect recovery
 
-TTS is split by the PC into segments of at most **512 ADPCM bytes**. Each segment is then split into <=20-byte NUS frames. The PC waits for the micro:bit to finish one segment before sending the next.
+After a valid voice session has connected, an unexpected Bluetooth disconnect no longer leaves the agent stuck waiting forever. The PC agent notices the session loss, closes the stale client, scans again, and keeps retrying until the board returns or you press Ctrl+C.
 
-## Troubleshooting BLE
+Firmware also evicts a raw half-open Windows connection after about 45 seconds so the board can advertise again.
 
-If the agent says no HyperBit was found, the launcher prints every BLE device Windows saw, including names, addresses, and advertised service UUIDs. Copy that block back for diagnosis.
+## Troubleshooting order
 
-Every scanned release also includes `BUILD_PROVENANCE.txt`, which records the exact source-tree hash, CODAL commit, BLE config verification, and calculated CODAL heap capacity used to produce that HEX.
+Use this order so failures stay isolated:
+
+1. Confirm Wukong boot self-test.
+2. Flash the `HyperBit.hex` from the same release ZIP as the PC agent.
+3. Run `TEST_BLE.bat` until protocol/firmware validation is stable.
+4. Only then configure the Hyper API key and run full voice mode.
+5. If full mode fails after BLE passes, the problem is above the transport layer (dependencies, Whisper, Hyper API, or TTS) rather than firmware discovery.
