@@ -8,7 +8,7 @@ A physical voice AI agent with a **BBC micro:bit V2 + ELECFREAKS Wukong** as its
 
 Use the latest GitHub Release and download `HyperBit-release.zip`. The release is created automatically only after firmware compilation, regression tests, provenance checks, and the configured security gates pass.
 
-Keep the `HyperBit.hex` and PC files from the **same release** together. The PC now validates the firmware revision during connection so an accidentally flashed old HEX is reported directly.
+Keep the `HyperBit.hex` and PC files from the **same release** together. The PC validates both firmware revision and required transport capabilities so an accidentally flashed old HEX is reported directly.
 
 ## Quick start
 
@@ -60,7 +60,9 @@ raw BLE connection
   -> PC validates identity
 ```
 
-Current hardened firmware is **protocol v2 / revision r3**.
+Current hardened firmware is **protocol v2 / revision r4**. Revision r4 adds a required buffered-notification capability for microphone streaming.
+
+At 8 kHz / 4-bit IMA ADPCM, the microphone produces about 4,000 compressed bytes per second. Protocol-v2 frames carry 17 audio bytes each, requiring roughly 236 notifications per second while speaking. Nordic S113 defaults to only one queued server notification, so the r4 build configures a **12-entry GATTS notification queue** and reserves additional lower RAM for the SoftDevice before it is enabled. The 512-byte microphone ring remains a second backpressure layer.
 
 During the raw connection and handshake, the micro:bit's 5×5 display is intentionally **black**. Firmware disables display refresh and performs no animation, accelerometer reads, Wukong updates, microphone work, speaker work, or button processing until READY has successfully been queued. Connection setup gets exclusive priority.
 
@@ -94,25 +96,35 @@ The Windows PC handles:
 
 The Hyper API key stays on the PC and `config.cmd` is intentionally excluded from version control/releases.
 
+## Reproducible CODAL transport override
+
+The queue/RAM change is not a hand-edited generated artifact. `firmware/codal_overrides.json` pins the reviewed CODAL commit and transport values, and `firmware/apply_codal_overrides.py` patches the freshly configured official CODAL tree only when its revision and expected source anchors match.
+
+Both local `BUILD_FIRMWARE.bat` and GitHub Actions configure CODAL first, apply this override second, and compile third. The automatic release then verifies the patched manager/linker hashes and the application-data boundary in the final ELF.
+
 ## Release gates and provenance
 
 Before an automatic release is published, GitHub Actions must successfully complete:
 
 - Python syntax checking,
-- protocol/BLE regression unit tests,
+- protocol/BLE/transport regression unit tests,
 - Bandit static analysis,
 - pip-audit dependency vulnerability checking,
 - ClamAV source scanning,
-- GNU Arm/CODAL firmware compilation,
-- byte-for-byte verification of the complete injected firmware source tree,
+- exact HyperBit source/config injection verification,
+- locked CODAL revision + fail-closed transport override verification,
+- a verified 12-entry SoftDevice notification queue,
+- reserved application-RAM/NOINIT boundary verification,
 - BLE open-link security configuration verification,
 - a guard preventing IRQ-masking Rainbow code,
-- real CODAL heap-capacity extraction from the linked ELF,
+- GNU Arm/CODAL firmware compilation,
+- final-ELF application-boundary verification,
+- real CODAL heap-capacity verification with a 64 KiB minimum,
 - ClamAV scanning of the final HEX/ZIP,
 - SHA-256 checksum generation.
 
-`BUILD_PROVENANCE.txt` records the exact build commit, complete firmware-tree hash, key source hashes, firmware revision, resolved CODAL commit, and actual dynamic heap capacity. This is how the release proves which source produced the HEX.
+`BUILD_PROVENANCE.txt` records the exact build commit, complete firmware-tree hash, key source hashes, firmware revision, resolved CODAL commit, transport queue/RAM settings, patched CODAL hashes, and actual dynamic heap capacity. This is how the release proves which source and transport configuration produced the HEX.
 
-Automated checks reduce risk but cannot prove the absence of every possible software defect or malicious behavior.
+Automated checks reduce risk but cannot prove the absence of every possible software defect or malicious behavior. Hardware BLE/audio behavior must still be validated on the actual device.
 
 See `INSTRUCTIONS.md` for setup/troubleshooting, `INFO.md` for architecture, `README_WINDOWS.md` for Windows details, and `PROTOCOL.md` for the wire protocol.
