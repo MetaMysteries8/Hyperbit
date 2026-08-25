@@ -1,0 +1,31 @@
+name: Dependency Audit
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "pc_agent/requirements.txt"
+      - ".github/workflows/dependency-audit.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pip-audit
+        run: python3 -m pip install --user pip-audit
+      - name: Audit and print report
+        shell: bash
+        run: |
+          set +e
+          pip-audit -r pc_agent/requirements.txt -f json -o audit.json
+          STATUS=$?
+          set -e
+          echo "===== pip-audit report ====="
+          cat audit.json
+          echo
+          exit "$STATUS"
