@@ -5,10 +5,18 @@ from dataclasses import dataclass
 
 from bleak import BleakClient, BleakScanner
 
-SERVICE_UUID = "7f9a0001-4c1d-4b8f-9a31-c62d5e8b1f70"
-MIC_UUID = "7f9a0002-4c1d-4b8f-9a31-c62d5e8b1f70"
-SPEAKER_UUID = "7f9a0003-4c1d-4b8f-9a31-c62d5e8b1f70"
-CONTROL_UUID = "7f9a0004-4c1d-4b8f-9a31-c62d5e8b1f70"
+# Standard Nordic UART Service (NUS). HyperBit no longer exposes the old
+# 7f9a... three-characteristic custom service.
+SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"  # PC -> micro:bit
+TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"  # micro:bit -> PC
+
+FRAME_CONTROL = 0xA0
+FRAME_MIC = 0xA1
+FRAME_TTS = 0xA2
+FRAME_HELLO = 0xA3
+PROTOCOL_VERSION = 2
+AUDIO_PAYLOAD_BYTES = 17
 
 EVT_PTT_START = 0x10
 EVT_PTT_END = 0x11
@@ -31,12 +39,10 @@ STATE_THINKING = 4
 STATE_SPEAKING = 5
 STATE_ERROR = 6
 
-TTS_SEGMENT_BYTES = 4096
+TTS_SEGMENT_BYTES = 512
 GATT_CONNECT_TIMEOUT_SECONDS = 35.0
-# Firmware evicts a half-open raw BLE link after ~45 seconds. If a Windows
-# GATT attempt consumes the full 35-second timeout, wait long enough for that
-# eviction/disconnect cycle to finish before opening the next connection.
 GATT_RECOVERY_WAIT_SECONDS = 15.0
+HELLO_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass
@@ -51,15 +57,15 @@ class HyperBitBLE:
         self.name_hint = name_hint
         self.address = address
         self.client: BleakClient | None = None
-        self.mic_char = None
-        self.speaker_char = None
-        self.control_char = None
+        self.tx_char = None
+        self.rx_char = None
         self._recv = bytearray()
         self._seq = None
         self._utterances: asyncio.Queue[Utterance] = asyncio.Queue()
         self._replay_requests: asyncio.Queue[None] = asyncio.Queue()
         self._loop = None
         self._cancel = asyncio.Event()
+        self._ready = asyncio.Event()
         self._tts_done = asyncio.Event()
         self._tts_done_ok = True
         self._tx_lock = asyncio.Lock()
@@ -113,35 +119,38 @@ class HyperBitBLE:
             pass
         finally:
             self.client = None
+            self.tx_char = None
+            self.rx_char = None
+            self._ready.clear()
 
-    def _resolve_hyperbit_chars(self):
+    def _resolve_nus_chars(self):
         assert self.client is not None
         svc = self.client.services.get_service(SERVICE_UUID)
         if svc is None:
             return None
-        mic = svc.get_characteristic(MIC_UUID)
-        speaker = svc.get_characteristic(SPEAKER_UUID)
-        control = svc.get_characteristic(CONTROL_UUID)
-        if not all((mic, speaker, control)):
+        tx = svc.get_characteristic(TX_UUID)
+        rx = svc.get_characteristic(RX_UUID)
+        if not all((tx, rx)):
             return None
-        return mic, speaker, control
+        return tx, rx
+
+    async def _write_frame(self, payload: bytes):
+        if len(payload) > 20:
+            raise ValueError(f"NUS frame too large: {len(payload)} bytes")
+        assert self.client and self.rx_char
+        props = {p.lower() for p in self.rx_char.properties}
+        response = "write-without-response" not in props
+        await self.client.write_gatt_char(self.rx_char, payload, response=response)
 
     async def connect(self):
-        # Discover once and KEEP this BLEDevice object. A failed GATT attempt can
-        # leave the micro:bit connected but no longer advertising, so rescanning
-        # between retries makes Windows lose the exact device we already found.
+        # Scan once and preserve the concrete Windows BLEDevice. A failed service
+        # discovery can leave the board connected and therefore not advertising.
         dev = await self._find()
 
-        # Start with Windows' cache because a valid cache is fastest. If that
-        # attempt times out or exposes a stale layout, every recovery attempt is
-        # uncached. Never return to the same potentially stale cache after a
-        # failure. The recovery delay is deliberately longer than the difference
-        # between Bleak's 35-second connect timeout and firmware's ~45-second
-        # half-open watchdog, so a fresh attempt does not get evicted mid-GATT.
         attempts = [
-            (True, "Windows cached GATT"),
-            (False, "fresh/uncached full GATT after firmware recovery"),
-            (False, "fresh/uncached full GATT retry"),
+            (True, "Windows cached services"),
+            (False, "fresh/uncached services after firmware recovery"),
+            (False, "fresh/uncached services retry"),
         ]
         last_error: BaseException | None = None
 
@@ -149,8 +158,7 @@ class HyperBitBLE:
             if attempt > 1:
                 print(
                     f"[ble] retry {attempt}/{len(attempts)}: reusing {dev.address}; "
-                    f"waiting {GATT_RECOVERY_WAIT_SECONDS:.0f}s for firmware BLE eviction/recovery "
-                    f"before {label}..."
+                    f"waiting {GATT_RECOVERY_WAIT_SECONDS:.0f}s for firmware BLE recovery..."
                 )
                 await asyncio.sleep(GATT_RECOVERY_WAIT_SECONDS)
 
@@ -169,13 +177,10 @@ class HyperBitBLE:
             try:
                 await self.client.connect()
 
-                chars = self._resolve_hyperbit_chars()
+                chars = self._resolve_nus_chars()
                 if chars is None:
                     if use_cache:
-                        print(
-                            "[ble] cached GATT connected but HyperBit service/layout was stale; "
-                            "waiting for a clean disconnect before uncached discovery"
-                        )
+                        print("[ble] cached service layout is stale; retrying uncached")
                         await self._disconnect_partial()
                         continue
 
@@ -183,51 +188,72 @@ class HyperBitBLE:
                     for service in self.client.services:
                         print(" ", service.uuid)
                     await self._disconnect_partial()
-                    raise RuntimeError("The board connected, but the HyperBit BLE service/layout is missing.")
+                    raise RuntimeError("The board connected, but Nordic UART Service is missing.")
 
-                self.mic_char, self.speaker_char, self.control_char = chars
+                self.tx_char, self.rx_char = chars
                 self._loop = asyncio.get_running_loop()
+                self._ready.clear()
 
-                await self.client.start_notify(self.mic_char, self._mic_notify)
-                await self.client.start_notify(self.control_char, self._control_notify)
-                print("[ble] connected; notifications armed")
+                # Subscribe first, then explicitly tell firmware that the NUS
+                # application session is ready. The firmware does not inspect
+                # CCCDs during Windows service discovery anymore.
+                await self.client.start_notify(self.tx_char, self._nus_notify)
+                await self._write_frame(bytes([FRAME_HELLO, PROTOCOL_VERSION]))
+
+                try:
+                    await asyncio.wait_for(self._ready.wait(), timeout=HELLO_TIMEOUT_SECONDS)
+                except asyncio.TimeoutError as exc:
+                    raise RuntimeError("Bluetooth connected, but HyperBit HELLO/READY handshake timed out") from exc
+
+                print(f"[ble] connected over Nordic UART Service; HyperBit protocol v{PROTOCOL_VERSION}")
                 await self.set_state(STATE_IDLE)
                 return
 
             except (TimeoutError, asyncio.TimeoutError) as exc:
                 last_error = exc
-                print("[ble] Windows timed out while establishing the GATT session.")
+                print("[ble] Windows timed out while establishing the BLE service session.")
                 await self._disconnect_partial()
-            except RuntimeError:
-                raise
+            except RuntimeError as exc:
+                last_error = exc
+                print(f"[ble] session attempt failed: {exc}")
+                await self._disconnect_partial()
             except Exception as exc:
                 last_error = exc
                 print(f"[ble] connection attempt failed: {type(exc).__name__}: {exc}")
                 await self._disconnect_partial()
 
         raise RuntimeError(
-            "Windows found the micro:bit but could not establish a usable HyperBit GATT session "
-            "after three attempts. The same BLEDevice was reused and both recovery attempts were "
-            "uncached and started after the firmware half-open eviction window. If the micro:bit "
-            "face also stops animating during the attempt, the firmware/SoftDevice side is stalling "
-            "and should be diagnosed next."
+            "Windows found the micro:bit but could not establish the Nordic UART Service session "
+            "after three attempts. The firmware now disables the LED matrix and all peripheral "
+            "activity during the raw connection window, so repeated failure here points at the "
+            "BLE/security/runtime layer rather than the fluid animation."
         ) from last_error
 
-    def _mic_notify(self, _sender, data: bytearray):
-        if not data:
-            return
-        seq = data[0]
-        payload = bytes(data[1:])
-        if self._seq is not None and seq != ((self._seq + 1) & 0xFF):
-            print(f"[ble] mic packet gap: expected {(self._seq + 1) & 0xFF}, got {seq}")
-        self._seq = seq
-        self._recv.extend(payload)
-
-    def _control_notify(self, _sender, data: bytearray):
+    def _nus_notify(self, _sender, data: bytearray):
         if not data or self._loop is None:
             return
 
-        code = data[0]
+        frame_type = data[0]
+
+        if frame_type == FRAME_MIC:
+            if len(data) < 3:
+                return
+            seq = data[1]
+            n = min(data[2], len(data) - 3)
+            payload = bytes(data[3:3 + n])
+            if self._seq is not None and seq != ((self._seq + 1) & 0xFF):
+                print(f"[ble] mic packet gap: expected {(self._seq + 1) & 0xFF}, got {seq}")
+            self._seq = seq
+            self._recv.extend(payload)
+            return
+
+        if frame_type != FRAME_CONTROL or len(data) < 2:
+            return
+
+        code = data[1]
+        a = data[2] if len(data) >= 3 else 0
+        b = data[3] if len(data) >= 4 else 0
+        c = data[4] if len(data) >= 5 else 0
 
         if code == EVT_PTT_START:
             self._recv.clear()
@@ -236,17 +262,18 @@ class HyperBitBLE:
             print("[device] gold logo down: microphone ON")
 
         elif code == EVT_PTT_END:
-            samples = 0
-            overflow = False
-            if len(data) >= 4:
-                samples = data[1] | (data[2] << 8) | ((data[3] & 0x7F) << 16)
-                overflow = bool(data[3] & 0x80)
+            samples = a | (b << 8) | ((c & 0x7F) << 16)
+            overflow = bool(c & 0x80)
             utt = Utterance(bytes(self._recv), samples, overflow)
             self._loop.call_soon_threadsafe(self._utterances.put_nowait, utt)
             print(f"[device] gold logo up: microphone OFF; {len(self._recv)} ADPCM bytes")
 
         elif code == EVT_READY:
-            print("[device] firmware ready")
+            if a != PROTOCOL_VERSION:
+                print(f"[device] protocol mismatch: firmware={a}, pc={PROTOCOL_VERSION}")
+            else:
+                print(f"[device] firmware ready; NUS transport protocol v{a}")
+            self._loop.call_soon_threadsafe(self._ready.set)
 
         elif code == EVT_CANCEL:
             print("[device] A: cancel/interrupt")
@@ -257,16 +284,14 @@ class HyperBitBLE:
             self._loop.call_soon_threadsafe(self._replay_requests.put_nowait, None)
 
         elif code == EVT_MUTE_CHANGED:
-            muted = bool(data[1]) if len(data) >= 2 else False
-            print(f"[device] A+B: {'muted' if muted else 'unmuted'}")
+            print(f"[device] A+B: {'muted' if a else 'unmuted'}")
 
         elif code == EVT_TTS_SEGMENT_DONE:
-            self._tts_done_ok = bool(data[1]) if len(data) >= 2 else True
+            self._tts_done_ok = bool(a)
             self._loop.call_soon_threadsafe(self._tts_done.set)
 
         elif code == EVT_WUKONG_STATUS:
-            ok = bool(data[1]) if len(data) >= 2 else False
-            print(f"[device] Wukong I2C base LEDs: {'OK' if ok else 'NOT RESPONDING'}")
+            print(f"[device] Wukong I2C base LEDs: {'OK' if a else 'NOT RESPONDING'}")
 
     async def next_utterance(self):
         return await self._utterances.get()
@@ -280,43 +305,53 @@ class HyperBitBLE:
     def clear_cancel(self):
         self._cancel.clear()
 
-    async def _write_control(self, payload: bytes):
-        assert self.client and self.control_char
-        props = {p.lower() for p in self.control_char.properties}
-        response = "write-without-response" not in props
-        await self.client.write_gatt_char(self.control_char, payload, response=response)
+    async def _write_control(self, code: int, a: int = 0, b: int = 0, c: int = 0, include_all: bool = False):
+        if include_all:
+            payload = bytes([FRAME_CONTROL, code & 0xFF, a & 0xFF, b & 0xFF, c & 0xFF])
+        elif c:
+            payload = bytes([FRAME_CONTROL, code & 0xFF, a & 0xFF, b & 0xFF, c & 0xFF])
+        elif b:
+            payload = bytes([FRAME_CONTROL, code & 0xFF, a & 0xFF, b & 0xFF])
+        elif a:
+            payload = bytes([FRAME_CONTROL, code & 0xFF, a & 0xFF])
+        else:
+            payload = bytes([FRAME_CONTROL, code & 0xFF])
+        await self._write_frame(payload)
 
     async def set_state(self, state: int):
-        await self._write_control(bytes([CMD_SET_STATE, state & 0xFF]))
+        await self._write_control(CMD_SET_STATE, state)
 
     async def abort_tts(self):
         if self.client and self.client.is_connected:
-            await self._write_control(bytes([CMD_TTS_ABORT]))
+            await self._write_control(CMD_TTS_ABORT)
 
     async def _send_tts_segment(self, segment: bytes, first: bool):
-        assert self.client and self.speaker_char
-
         self._tts_done.clear()
         self._tts_done_ok = True
 
-        await self._write_control(
-            bytes([CMD_TTS_START, len(segment) & 0xFF, (len(segment) >> 8) & 0xFF, 1 if first else 0])
+        # Start frame is always fixed-width so a zero high-byte/first flag is not
+        # accidentally omitted by compact control encoding.
+        await self._write_frame(
+            bytes([
+                FRAME_CONTROL,
+                CMD_TTS_START,
+                len(segment) & 0xFF,
+                (len(segment) >> 8) & 0xFF,
+                1 if first else 0,
+            ])
         )
 
-        props = {p.lower() for p in self.speaker_char.properties}
-        response = "write-without-response" not in props
         seq = 0
-
-        for off in range(0, len(segment), 19):
+        for off in range(0, len(segment), AUDIO_PAYLOAD_BYTES):
             if self.cancelled():
                 await self.abort_tts()
                 return False
-            packet = bytes([seq]) + segment[off:off + 19]
-            await self.client.write_gatt_char(self.speaker_char, packet, response=response)
+            chunk = segment[off:off + AUDIO_PAYLOAD_BYTES]
+            await self._write_frame(bytes([FRAME_TTS, seq, len(chunk)]) + chunk)
             seq = (seq + 1) & 0xFF
             await asyncio.sleep(0.003)
 
-        await self._write_control(bytes([CMD_TTS_END]))
+        await self._write_control(CMD_TTS_END)
 
         try:
             await asyncio.wait_for(self._tts_done.wait(), timeout=8.0)
@@ -344,3 +379,5 @@ class HyperBitBLE:
                     await self.client.disconnect()
             finally:
                 self.client = None
+                self.tx_char = None
+                self.rx_char = None
