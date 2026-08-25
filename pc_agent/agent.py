@@ -39,37 +39,79 @@ async def voice_mode(args):
     tts = create_tts()
     ble = HyperBitBLE(args.name, args.address)
 
+    state = {"last_tts": b""}
+
     await ble.connect()
     print(f"[agent] Hyper model: {agent.model}")
-    print("[agent] hold the gold logo, speak, then release it")
+    print("[controls] hold GOLD LOGO = talk | A = interrupt | B = replay | A+B = mute")
+
+    async def replay_worker():
+        while True:
+            await ble.next_replay_request()
+            if not state["last_tts"]:
+                print("[agent] nothing to replay yet")
+                continue
+            ble.clear_cancel()
+            print("[agent] replaying last answer")
+            await ble.set_state(STATE_SPEAKING)
+            await ble.send_tts(state["last_tts"])
+            await ble.set_state(STATE_IDLE)
+
+    replay_task = asyncio.create_task(replay_worker())
 
     try:
         while True:
             utt = await ble.next_utterance()
+            ble.clear_cancel()
+
             if not utt.adpcm:
                 print("[stt] empty utterance")
                 continue
+
+            if utt.overflow:
+                print("[mic] warning: microphone/BLE ring overflowed during this utterance")
 
             try:
                 await ble.set_state(STATE_TRANSCRIBING)
                 pcm = decode_ima_adpcm(utt.adpcm, utt.sample_count or None)
                 text = await asyncio.to_thread(stt.transcribe, pcm, 8000)
+
+                if ble.cancelled():
+                    print("[agent] cancelled during transcription")
+                    await ble.set_state(STATE_IDLE)
+                    continue
+
                 if not text:
                     print("[stt] no speech recognized")
                     await ble.set_state(STATE_IDLE)
                     continue
+
                 print(f"\nYOU: {text}")
 
                 await ble.set_state(STATE_THINKING)
                 reply, usage = await asyncio.to_thread(agent.ask, text)
+
+                if ble.cancelled():
+                    print("[agent] response cancelled; answer will not be spoken")
+                    await ble.set_state(STATE_IDLE)
+                    continue
+
                 print(f"HYPERBIT: {reply}")
                 u = usage_line(usage)
                 if u:
                     print(f"[hyper] {u}")
 
                 adpcm = await asyncio.to_thread(tts.synthesize_adpcm, reply, 8000)
+
+                if ble.cancelled():
+                    await ble.set_state(STATE_IDLE)
+                    continue
+
+                state["last_tts"] = adpcm
                 await ble.set_state(STATE_SPEAKING)
-                await ble.send_tts(adpcm)
+                completed = await ble.send_tts(adpcm)
+                if not completed:
+                    print("[agent] playback interrupted")
                 await ble.set_state(STATE_IDLE)
 
             except Exception as exc:
@@ -81,6 +123,7 @@ async def voice_mode(args):
                 except Exception:
                     pass
     finally:
+        replay_task.cancel()
         await ble.close()
 
 
