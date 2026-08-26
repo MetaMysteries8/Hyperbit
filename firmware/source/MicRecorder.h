@@ -3,7 +3,9 @@
 #include "DataStream.h"
 #include "ImaAdpcm.h"
 
-#define HYPERBIT_MIC_RING_BYTES 1024
+// Audio is drained continuously while the logo is held. Keeping this ring small
+// leaves materially more heap/stack headroom for the BLE SoftDevice at runtime.
+#define HYPERBIT_MIC_RING_BYTES 512
 
 class MicRecorder : public codal::DataSink {
     codal::DataSource &upstream;

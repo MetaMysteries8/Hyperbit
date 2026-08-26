@@ -6,13 +6,19 @@ on:
     paths:
       - "firmware/**"
       - "pc_agent/**"
+      - "tests/**"
       - "HyperBit.py"
       - "HI.md"
       - "INSTRUCTIONS.md"
       - "INFO.md"
       - "PROTOCOL.md"
+      - "README.md"
+      - "README_WINDOWS.md"
       - "config.example.cmd"
+      - "BUILD_FIRMWARE.bat"
+      - "BUILD_FIRMWARE.ps1"
       - "RUN_HYPERBIT.bat"
+      - "TEST_BLE.bat"
       - "FLASH_FIRMWARE.bat"
       - "FLASH_FIRMWARE.ps1"
       - ".github/workflows/build-firmware.yml"
@@ -21,24 +27,34 @@ on:
     paths:
       - "firmware/**"
       - "pc_agent/**"
+      - "tests/**"
       - "HyperBit.py"
       - "HI.md"
       - "INSTRUCTIONS.md"
       - "INFO.md"
       - "PROTOCOL.md"
+      - "README.md"
+      - "README_WINDOWS.md"
       - "config.example.cmd"
+      - "BUILD_FIRMWARE.bat"
+      - "BUILD_FIRMWARE.ps1"
       - "RUN_HYPERBIT.bat"
+      - "TEST_BLE.bat"
       - "FLASH_FIRMWARE.bat"
       - "FLASH_FIRMWARE.ps1"
       - ".github/workflows/build-firmware.yml"
   workflow_dispatch:
+
+concurrency:
+  group: hyperbit-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: write
 
 jobs:
   build-scan-release:
-    name: Compile, scan, package and release
+    name: Compile, test, scan, package and release
     runs-on: ubuntu-22.04
 
     steps:
@@ -60,7 +76,6 @@ jobs:
             zip \
             clamav \
             clamav-freshclam
-
           python3 -m pip install --upgrade pip
           python3 -m pip install bandit pip-audit
 
@@ -71,13 +86,21 @@ jobs:
 
       - name: Python syntax check
         run: |
-          python3 -m compileall -q HyperBit.py pc_agent
+          python3 -m compileall -q HyperBit.py pc_agent tests firmware/apply_codal_overrides.py
+
+      - name: Protocol and BLE regression tests
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p dist
+          python3 -m unittest discover -s tests -v 2>&1 | tee dist/unit-tests.txt
 
       - name: Bandit static analysis
         run: |
           mkdir -p dist
           bandit -r pc_agent -ll -ii -f txt -o dist/security-bandit.txt
           bandit HyperBit.py -ll -ii -f txt -o dist/security-bandit-launcher.txt
+          bandit firmware/apply_codal_overrides.py -ll -ii -f txt -o dist/security-bandit-build.txt
 
       - name: Python dependency vulnerability audit
         run: |
@@ -90,6 +113,7 @@ jobs:
           clamscan --recursive --infected \
             --exclude-dir='^\.git$' \
             --exclude-dir='^dist$' \
+            --exclude-dir='^\.build$' \
             . | tee dist/security-clamav-source.txt
 
       - name: Clone official micro:bit V2 CODAL samples
@@ -104,9 +128,148 @@ jobs:
           cp firmware/source/* .build/microbit-v2-samples/source/
           cp firmware/codal.json .build/microbit-v2-samples/codal.json
 
+      - name: Configure locked CODAL tree
+        shell: bash
+        run: |
+          set -o pipefail
+          cmake \
+            -S .build/microbit-v2-samples \
+            -B .build/microbit-v2-samples/build \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -G Ninja 2>&1 | tee dist/firmware-configure.log
+
+      - name: Apply reviewed SoftDevice transport override
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 firmware/apply_codal_overrides.py \
+            --samples-root .build/microbit-v2-samples \
+            2>&1 | tee dist/codal-override.log
+
       - name: Compile HyperBit.hex
-        working-directory: .build/microbit-v2-samples
-        run: python3 build.py
+        shell: bash
+        run: |
+          set -o pipefail
+          cmake --build .build/microbit-v2-samples/build --parallel 10 \
+            2>&1 | tee dist/firmware-build.log
+
+      - name: Verify build provenance and BLE configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SAMPLES=.build/microbit-v2-samples
+          TARGET="$SAMPLES/libraries/codal-microbit-v2"
+          MANAGER="$TARGET/source/bluetooth/MicroBitBLEManager.cpp"
+          LINKER="$TARGET/ld/nrf52833-softdevice.ld"
+
+          # The application source/config copied into the sample project must be
+          # byte-identical to this exact HyperBit checkout.
+          diff -qr firmware/source "$SAMPLES/source"
+          cmp firmware/codal.json "$SAMPLES/codal.json"
+
+          HVN_QUEUE="$(python3 -c 'import json; print(json.load(open("firmware/codal_overrides.json"))["hvn_tx_queue_size"])')"
+          APP_RAM_ORIGIN="$(python3 -c 'import json; print(json.load(open("firmware/codal_overrides.json"))["application_ram_origin"])')"
+          NOINIT_ORIGIN="$(python3 -c 'import json; print(json.load(open("firmware/codal_overrides.json"))["noinit_origin"])')"
+          RAM_END_HEX="$(python3 -c 'import json; print(json.load(open("firmware/codal_overrides.json"))["ram_end"])')"
+          STACK_RESERVE="$(python3 -c 'import json; print(json.load(open("firmware/codal_overrides.json"))["stack_reserve_bytes"])')"
+          EXPECTED_CODAL="$(python3 -c 'import json; print(json.load(open("firmware/codal_overrides.json"))["expected_codal_microbit_v2_commit"])')"
+          CODAL_COMMIT="$(git -C "$TARGET" rev-parse HEAD)"
+
+          test "$CODAL_COMMIT" = "$EXPECTED_CODAL"
+          test "$HVN_QUEUE" = "12"
+          grep -Fq 'HYPERBIT_CODAL_OVERRIDE' "$MANAGER"
+          test "$(grep -Fc 'HYPERBIT_CODAL_OVERRIDE' "$MANAGER")" -eq 1
+          grep -Fq "hvn_tx_queue_size = ${HVN_QUEUE};" "$MANAGER"
+          grep -Fq 'BLE_CONN_CFG_GATTS' "$MANAGER"
+          grep -Fq "NOINIT (rwx) : ORIGIN = ${NOINIT_ORIGIN^^}" "$LINKER"
+          grep -Fq "RAM (rwx) : ORIGIN = ${APP_RAM_ORIGIN^^}" "$LINKER"
+
+          # The nRF5 SDK has a macro path that can otherwise redefine OPEN_LINK
+          # security to MITM. Any recurrence is release-blocking.
+          if cat dist/firmware-configure.log dist/firmware-build.log | \
+             grep -Fq '"MICROBIT_BLE_SECURITY_MODE" redefined'; then
+            echo "ERROR: BLE security mode was redefined during compilation." >&2
+            exit 1
+          fi
+
+          # Live Rainbow updates must remain on CODAL's PWM2 path and never mask
+          # interrupts around WS2812 traffic while the SoftDevice is active.
+          if grep -Eq '__disable_irq|target_disable_irq|target_enable_irq' firmware/source/WukongRainbow.*; then
+            echo "ERROR: Wukong Rainbow driver masks interrupts." >&2
+            exit 1
+          fi
+          grep -Fq 'neopixel_send_buffer' firmware/source/WukongRainbow.cpp
+
+          ELF="$SAMPLES/build/MICROBIT"
+          test -f "$ELF"
+          test -f "$SAMPLES/MICROBIT.hex"
+
+          # CODAL deliberately fills .heap to RAM_END-stack in its linker map.
+          # __end__ is the real beginning of dynamic heap, so calculate actual
+          # capacity from the patched application origin rather than GNU's 98%.
+          END_HEX="$(arm-none-eabi-nm -n "$ELF" | awk '$3 == "__end__" {print $1; exit}')"
+          DATA_START_HEX="$(arm-none-eabi-nm -n "$ELF" | awk '$3 == "__data_start__" {print $1; exit}')"
+          test -n "$END_HEX"
+          test -n "$DATA_START_HEX"
+
+          STATIC_END=$((0x${END_HEX}))
+          DATA_START=$((0x${DATA_START_HEX}))
+          RAM_START=$((APP_RAM_ORIGIN))
+          RAM_END=$((RAM_END_HEX))
+          HEAP_LIMIT=$((RAM_END - STACK_RESERVE))
+          STATIC_RAM_BYTES=$((STATIC_END - RAM_START))
+          HEAP_CAPACITY_BYTES=$((HEAP_LIMIT - STATIC_END))
+
+          if (( DATA_START < RAM_START )); then
+            echo "ERROR: linked application data starts inside reserved SoftDevice RAM." >&2
+            exit 1
+          fi
+          if (( HEAP_CAPACITY_BYTES < 65536 )); then
+            echo "ERROR: less than 64 KiB CODAL heap capacity remains after transport reservation." >&2
+            exit 1
+          fi
+
+          PROTOCOL_VERSION="$(awk '$1 == "#define" && $2 == "HYPERBIT_PROTOCOL_VERSION" {print $3}' firmware/source/VoiceBLEService.h)"
+          FIRMWARE_REVISION="$(awk '$1 == "#define" && $2 == "HYPERBIT_FIRMWARE_REVISION" {print $3}' firmware/source/VoiceBLEService.h)"
+          test "$PROTOCOL_VERSION" = "2"
+          test "$FIRMWARE_REVISION" = "4"
+
+          FIRMWARE_TREE_SHA="$(find firmware/source -maxdepth 1 -type f -printf '%f\0' | sort -z | while IFS= read -r -d '' f; do sha256sum "firmware/source/$f"; done | sha256sum | awk '{print $1}')"
+          {
+            echo "HyperBit build provenance"
+            echo "github_commit=${GITHUB_SHA}"
+            echo "github_run=${GITHUB_RUN_NUMBER}"
+            echo "hyperbit_protocol_version=${PROTOCOL_VERSION}"
+            echo "hyperbit_firmware_revision=${FIRMWARE_REVISION}"
+            echo "codal_commit=${CODAL_COMMIT}"
+            echo "codal_requested_branch=$(python3 -c 'import json; print(json.load(open("firmware/codal.json"))["target"]["branch"])')"
+            echo "hyperbit_hvn_tx_queue_size=${HVN_QUEUE}"
+            echo "application_ram_origin=${APP_RAM_ORIGIN}"
+            echo "noinit_origin=${NOINIT_ORIGIN}"
+            echo "firmware_source_tree_sha256=${FIRMWARE_TREE_SHA}"
+            echo "codal_override_script_sha256=$(sha256sum firmware/apply_codal_overrides.py | awk '{print $1}')"
+            echo "codal_override_config_sha256=$(sha256sum firmware/codal_overrides.json | awk '{print $1}')"
+            echo "patched_ble_manager_sha256=$(sha256sum "$MANAGER" | awk '{print $1}')"
+            echo "patched_softdevice_linker_sha256=$(sha256sum "$LINKER" | awk '{print $1}')"
+            echo "main_cpp_sha256=$(sha256sum firmware/source/main.cpp | awk '{print $1}')"
+            echo "voice_cpp_sha256=$(sha256sum firmware/source/VoiceBLEService.cpp | awk '{print $1}')"
+            echo "voice_h_sha256=$(sha256sum firmware/source/VoiceBLEService.h | awk '{print $1}')"
+            echo "mic_recorder_h_sha256=$(sha256sum firmware/source/MicRecorder.h | awk '{print $1}')"
+            echo "rainbow_cpp_sha256=$(sha256sum firmware/source/WukongRainbow.cpp | awk '{print $1}')"
+            echo "codal_json_sha256=$(sha256sum firmware/codal.json | awk '{print $1}')"
+            echo "pc_ble_link_sha256=$(sha256sum pc_agent/ble_link.py | awk '{print $1}')"
+            echo "linked_data_start=0x${DATA_START_HEX}"
+            echo "static_ram_end=0x${END_HEX}"
+            echo "static_ram_bytes=${STATIC_RAM_BYTES}"
+            echo "codal_heap_capacity_bytes=${HEAP_CAPACITY_BYTES}"
+            echo "stack_reserve_bytes=${STACK_RESERVE}"
+            echo
+            echo "GNU linker region summary (includes CODAL's fill-to-limit .heap section):"
+            grep -E '^[[:space:]]+(FLASH|RAM):' dist/firmware-build.log || true
+          } > dist/BUILD_PROVENANCE.txt
+
+          cat dist/BUILD_PROVENANCE.txt
 
       - name: Build release ZIP
         shell: bash
@@ -119,7 +282,6 @@ jobs:
 
           cp .build/microbit-v2-samples/MICROBIT.hex dist/HyperBit.hex
           cp dist/HyperBit.hex dist/release/HyperBit.hex
-
           cp HyperBit.py dist/release/HyperBit.py
           cp HI.md dist/release/HI.md
           cp INSTRUCTIONS.md dist/release/INSTRUCTIONS.md
@@ -127,28 +289,34 @@ jobs:
           cp PROTOCOL.md dist/release/PROTOCOL.md
           cp config.example.cmd dist/release/config.example.cmd
           cp RUN_HYPERBIT.bat dist/release/RUN_HYPERBIT.bat
+          cp TEST_BLE.bat dist/release/TEST_BLE.bat
           cp FLASH_FIRMWARE.bat dist/release/FLASH_FIRMWARE.bat
           cp FLASH_FIRMWARE.ps1 dist/release/FLASH_FIRMWARE.ps1
-
+          cp dist/BUILD_PROVENANCE.txt dist/release/BUILD_PROVENANCE.txt
           cp pc_agent/*.py dist/release/pc_agent/
           cp pc_agent/requirements.txt dist/release/requirements.txt
 
           cat > dist/release/SECURITY_SCAN.md <<EOF
           # HyperBit Release Verification
 
-          This release is produced only after the GitHub Actions pipeline successfully completes all configured gates:
+          This release is produced only after the configured pipeline passes:
 
-          - Python bytecode/syntax compilation check.
-          - Bandit static analysis for medium-or-higher severity findings with medium-or-higher confidence.
-          - pip-audit dependency vulnerability audit.
-          - ClamAV recursive scan of the checked-out HyperBit source/package scripts.
-          - Successful CODAL/GNU Arm compilation of the micro:bit V2 firmware.
-          - ClamAV scan of the final release ZIP and HEX before publication.
+          - Python syntax/bytecode checks and protocol/BLE regression tests.
+          - Bandit static analysis and pip-audit dependency vulnerability checks.
+          - ClamAV source and final-package scans.
+          - Exact HyperBit source/config injection verification.
+          - Locked CODAL commit verification.
+          - Fail-closed application of the reviewed SoftDevice HVN queue/RAM override.
+          - Verification of a 12-entry server notification queue and reserved application RAM boundary.
+          - BLE open-link security conflict detection.
+          - Non-IRQ-masking hardware-PWM Rainbow-driver verification.
+          - Successful GNU Arm micro:bit V2 firmware compilation.
+          - Linked application-boundary and minimum 64 KiB heap-capacity verification.
 
           Release build: ${GITHUB_RUN_NUMBER}
           Commit: ${GITHUB_SHA}
 
-          Automated scanning substantially improves release hygiene, but no automated scanner can prove the absence of every possible defect or unsafe behavior.
+          Automated checks substantially improve release hygiene, but no automated check can prove the absence of every possible defect or unsafe behavior.
           EOF
 
           (cd dist/release && zip -qr ../HyperBit-release.zip .)
@@ -175,21 +343,18 @@ jobs:
 
           ## Downloads
 
-          - **HyperBit-release.zip** — recommended package. Contains compiled firmware, the one-click Windows launcher, Python agent, docs, config template, and flashing helpers.
-          - **HyperBit.hex** — firmware only for a BBC micro:bit V2.
+          - **HyperBit-release.zip** — recommended complete Windows package.
+          - **HyperBit.hex** — firmware-only image for BBC micro:bit V2.
+          - **BUILD_PROVENANCE.txt** — exact HyperBit/CODAL identity, transport queue/RAM configuration, source hashes and linked heap measurement.
           - **CHECKSUMS.sha256** — SHA-256 checksums for the firmware and ZIP.
 
-          ## Hardware controls
+          ## Transport revision
 
-          - Gold logo: hold to talk; microphone is physically enabled only while held.
-          - A: cancel/interrupt.
-          - B: replay last answer.
-          - A+B: mute/unmute.
-          - Wukong base + Rainbow LEDs: physical agent-state display.
+          Firmware revision 4 keeps protocol v2/NUS framing but adds a verified 12-entry SoftDevice notification queue and conservative lower-RAM reservation for streamed microphone audio. The PC agent requires this buffered-transport capability so stale firmware is rejected explicitly.
 
-          ## Release gates
+          ## Diagnostics
 
-          This release was published only after Python syntax checks, Bandit static analysis, dependency auditing, ClamAV source/package scans, and the micro:bit V2 firmware build completed successfully.
+          Run **TEST_BLE.bat** to test Bluetooth/NUS/HELLO/READY without a Hyper API key, Whisper, model call, or TTS.
           EOF
 
       - name: Upload workflow artifact
@@ -202,6 +367,11 @@ jobs:
             dist/HyperBit.hex
             dist/HyperBit-release.zip
             dist/CHECKSUMS.sha256
+            dist/BUILD_PROVENANCE.txt
+            dist/firmware-configure.log
+            dist/firmware-build.log
+            dist/codal-override.log
+            dist/unit-tests.txt
             dist/release/SECURITY_SCAN.md
             dist/security-*.txt
             dist/security-*.json
@@ -217,8 +387,11 @@ jobs:
             dist/HyperBit-release.zip \
             dist/HyperBit.hex \
             dist/CHECKSUMS.sha256 \
+            dist/BUILD_PROVENANCE.txt \
+            dist/unit-tests.txt \
             dist/security-bandit.txt \
             dist/security-bandit-launcher.txt \
+            dist/security-bandit-build.txt \
             dist/security-pip-audit.json \
             dist/security-clamav-source.txt \
             dist/security-clamav-package.txt \
@@ -232,12 +405,15 @@ jobs:
         run: |
           echo "### HyperBit build ${GITHUB_RUN_NUMBER}" >> "$GITHUB_STEP_SUMMARY"
           echo "- Firmware compiled: ✅" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Python syntax check: ✅" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Bandit static analysis: ✅" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Dependency audit: ✅" >> "$GITHUB_STEP_SUMMARY"
-          echo "- ClamAV source scan: ✅" >> "$GITHUB_STEP_SUMMARY"
-          echo "- ClamAV release scan: ✅" >> "$GITHUB_STEP_SUMMARY"
-          echo "- SHA-256 checksums generated: ✅" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Protocol/BLE regression tests: ✅" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Security/dependency scans: ✅" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Exact source + locked CODAL identity: ✅" >> "$GITHUB_STEP_SUMMARY"
+          echo "- SoftDevice HVN queue = 12: ✅" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Reserved application RAM boundary verified: ✅" >> "$GITHUB_STEP_SUMMARY"
+          echo "- BLE security macro conflict absent: ✅" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Safe hardware-PWM Rainbow path verified: ✅" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Linked heap capacity >= 64 KiB: ✅" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Final package scan/checksums: ✅" >> "$GITHUB_STEP_SUMMARY"
           if [ "${{ github.event_name }}" != "pull_request" ]; then
             echo "- GitHub Release: ✅ build-${GITHUB_RUN_NUMBER}" >> "$GITHUB_STEP_SUMMARY"
           fi

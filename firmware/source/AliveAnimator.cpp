@@ -35,6 +35,19 @@ AliveAnimator::AliveAnimator(MicroBit &microbit, WukongLights &baseLights, Wukon
     bit.display.clear();
 }
 
+void AliveAnimator::updateRainbowState() {
+    // PHYS_CONNECTING deliberately performs no peripheral work at all. Outside
+    // that isolated window the Wukong driver uses CODAL's hardware PWM path,
+    // which does not mask BLE interrupts.
+    if (stateValue == PHYS_CONNECTING)
+        return;
+
+    uint8_t rgbState = stateValue;
+    if (mutedValue && stateValue != PHYS_LISTENING && stateValue != PHYS_UPLOADING)
+        rgbState = PHYS_MUTED;
+    rainbow.state(rgbState);
+}
+
 void AliveAnimator::setState(uint8_t state) {
     if (stateValue == state)
         return;
@@ -46,9 +59,7 @@ void AliveAnimator::setState(uint8_t state) {
     baseDivider = 0;
     lastBaseLevel = 255;
 
-    // The raw BLE/GATT connecting state is intentionally matrix-only. Do not
-    // touch the shared I2C bus or Wukong controller while Windows is discovering
-    // attributes; this state is also a diagnostic heartbeat for firmware stalls.
+    // The raw BLE/GATT connecting state is intentionally peripheral-free.
     if (state == PHYS_CONNECTING)
         return;
 
@@ -58,6 +69,15 @@ void AliveAnimator::setState(uint8_t state) {
         base.steady(18);
         baseDynamic = true;
     }
+
+    updateRainbowState();
+}
+
+void AliveAnimator::setMuted(bool muted) {
+    if (mutedValue == muted)
+        return;
+    mutedValue = muted;
+    updateRainbowState();
 }
 
 void AliveAnimator::clearMatrix() {
@@ -118,8 +138,8 @@ void AliveAnimator::renderFluid(int ax, int ay, bool dimmer) {
 void AliveAnimator::renderConnecting() {
     clearMatrix();
 
-    // Pure 5x5 heartbeat/spinner. No accelerometer reads, Wukong I2C writes,
-    // microphone/audio work, or NeoPixel traffic is involved in this frame.
+    // Retained for diagnostics/manual use, but the production connection path
+    // disables the matrix refresh hardware entirely until READY is delivered.
     static const uint8_t path[12][2] = {
         {2,0},{3,0},{4,1},{4,2},{4,3},{3,4},
         {2,4},{1,4},{0,3},{0,2},{0,1},{1,0}
@@ -251,11 +271,9 @@ void AliveAnimator::updateBodyGlow(uint8_t level) {
 }
 
 void AliveAnimator::renderWukong(int ax, int ay, uint8_t level) {
-    // Intentionally no live P16 WS2812 writes here. WukongRainbow::show()
-    // currently masks IRQs around a bit-banged transfer, which is unsafe while
-    // Nordic's BLE SoftDevice is active and can provoke panic 070. The four RGB
-    // LEDs are set once before BLE advertising begins; the 8 blue I2C base LEDs
-    // remain animated here without interrupt masking.
+    // Rainbow color changes happen only on state/mute transitions. The per-frame
+    // path intentionally avoids extra PWM reconfiguration; the eight base LEDs
+    // carry the dynamic brightness animation over I2C.
     (void)ax;
     (void)ay;
     (void)level;
@@ -264,9 +282,9 @@ void AliveAnimator::renderWukong(int ax, int ay, uint8_t level) {
 void AliveAnimator::tick() {
     ++frame;
 
-    // This path is intentionally before ANY accelerometer or Wukong access.
-    // If this animation stops during GATT discovery, the problem is below the
-    // peripheral animation layer (display scheduling / BLE SoftDevice runtime).
+    // Keep this path before ANY accelerometer or Wukong access. Production raw
+    // connection setup disables display refresh entirely, but this remains safe
+    // if PHYS_CONNECTING is ever rendered manually.
     if (stateValue == PHYS_CONNECTING) {
         renderConnecting();
         return;

@@ -47,6 +47,7 @@ class AliveAnimator {
     void renderError();
     void renderWukong(int ax, int ay, uint8_t level);
     void updateBodyGlow(uint8_t level);
+    void updateRainbowState();
 
 public:
     AliveAnimator(codal::MicroBit &microbit, WukongLights &baseLights, WukongRainbow &rainbowLights);
@@ -55,7 +56,7 @@ public:
     uint8_t state() const { return stateValue; }
     void setInputLevel(uint8_t level) { inputLevelValue = level; }
     void setOutputLevel(uint8_t level) { outputLevelValue = level; }
-    void setMuted(bool muted) { mutedValue = muted; }
+    void setMuted(bool muted);
 
     void tick();
 };

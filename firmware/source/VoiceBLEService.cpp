@@ -4,17 +4,19 @@ using namespace codal;
 
 static uint8_t TTS_BUFFER[HYPERBIT_MAX_TTS_ADPCM];
 
-// RegisterBaseUUID reverses this array internally for the Nordic SoftDevice,
-// so keep it here in normal human UUID byte order.
-static const uint8_t HB_BASE_UUID[16] = {
-    0x7f,0x9a,0x00,0x00,0x4c,0x1d,0x4b,0x8f,
-    0x9a,0x31,0xc6,0x2d,0x5e,0x8b,0x1f,0x70
+// Nordic UART Service base UUID in human byte order. RegisterBaseUUID() handles
+// the SoftDevice byte order internally.
+static const uint8_t NUS_BASE_UUID[16] = {
+    0x6e,0x40,0x00,0x00,0xb5,0xa3,0xf3,0x93,
+    0xe0,0xa9,0xe5,0x0e,0x24,0xdc,0xca,0x9e
 };
 
-static const uint16_t HB_SERVICE_UUID = 0x0001;
-static const uint16_t HB_CHAR_UUID[HB_CHAR_COUNT] = {0x0002, 0x0003, 0x0004};
+static const uint16_t NUS_SERVICE_UUID = 0x0001;
+static const uint16_t NUS_TX_UUID = 0x0003;
+static const uint16_t NUS_RX_UUID = 0x0002;
 
 VoiceBLEService::VoiceBLEService() :
+    sessionReadyFlag(false),
     ttsReceiving(false),
     ttsReadyFlag(false),
     ttsLen(0),
@@ -23,15 +25,51 @@ VoiceBLEService::VoiceBLEService() :
     expectedSpeakerSeq(0),
     pcStateValue(0)
 {
-    RegisterBaseUUID(HB_BASE_UUID);
-    CreateService(HB_SERVICE_UUID);
-    CreateCharacteristic(HB_MIC, HB_CHAR_UUID[HB_MIC], micValue, 0, sizeof(micValue), microbit_propNOTIFY);
-    CreateCharacteristic(HB_SPEAKER, HB_CHAR_UUID[HB_SPEAKER], speakerValue, 0, sizeof(speakerValue), microbit_propWRITE | microbit_propWRITE_WITHOUT);
-    CreateCharacteristic(HB_CONTROL, HB_CHAR_UUID[HB_CONTROL], controlValue, 0, sizeof(controlValue), microbit_propWRITE | microbit_propWRITE_WITHOUT | microbit_propNOTIFY);
+    RegisterBaseUUID(NUS_BASE_UUID);
+    CreateService(NUS_SERVICE_UUID);
+
+    // Standard NUS shape: one TX notify characteristic and one RX write
+    // characteristic. All HyperBit packet types are multiplexed over these two.
+    CreateCharacteristic(
+        HB_NUS_TX,
+        NUS_TX_UUID,
+        txValue,
+        0,
+        sizeof(txValue),
+        microbit_propNOTIFY
+    );
+
+    CreateCharacteristic(
+        HB_NUS_RX,
+        NUS_RX_UUID,
+        rxValue,
+        0,
+        sizeof(rxValue),
+        microbit_propWRITE | microbit_propWRITE_WITHOUT
+    );
 }
 
 const uint8_t *VoiceBLEService::ttsData() const {
     return TTS_BUFFER;
+}
+
+void VoiceBLEService::resetSession() {
+    sessionReadyFlag = false;
+    pcStateValue = 0;
+    abortTts();
+}
+
+void VoiceBLEService::onConnect(const microbit_ble_evt_t *p_ble_evt) {
+    (void)p_ble_evt;
+    // Never inherit application state across a fast reconnect.
+    resetSession();
+}
+
+void VoiceBLEService::onDisconnect(const microbit_ble_evt_t *p_ble_evt) {
+    (void)p_ble_evt;
+    // Reset immediately in BLE event context instead of waiting for main-loop
+    // polling to notice the disconnect.
+    resetSession();
 }
 
 void VoiceBLEService::abortTts() {
@@ -44,79 +82,130 @@ void VoiceBLEService::abortTts() {
 }
 
 bool VoiceBLEService::sendControl(uint8_t code, uint8_t a, uint8_t b, uint8_t c) {
-    uint8_t msg[4] = {code, a, b, c};
-    if (!getConnected() || !notifyChrValueEnabled(HB_CONTROL))
+    if (!getConnected() || !sessionReadyFlag || !notifyChrValueEnabled(HB_NUS_TX))
         return false;
-    return notifyChrValue(HB_CONTROL, msg, sizeof(msg));
+
+    uint8_t frame[5] = {HB_FRAME_CONTROL, code, a, b, c};
+    return notifyChrValue(HB_NUS_TX, frame, sizeof(frame));
 }
 
 bool VoiceBLEService::sendMic(uint8_t seq, const uint8_t *data, int len) {
-    if (!getConnected() || !notifyChrValueEnabled(HB_MIC))
+    if (!getConnected() || !sessionReadyFlag || !notifyChrValueEnabled(HB_NUS_TX) || !data || len < 0)
         return false;
-    if (len < 0)
-        return false;
-    if (len > 19)
-        len = 19;
 
-    uint8_t packet[20];
-    packet[0] = seq;
+    if (len > HYPERBIT_NUS_AUDIO_PAYLOAD)
+        len = HYPERBIT_NUS_AUDIO_PAYLOAD;
+
+    uint8_t frame[20];
+    frame[0] = HB_FRAME_MIC;
+    frame[1] = seq;
+    frame[2] = (uint8_t)len;
     for (int i = 0; i < len; ++i)
-        packet[i + 1] = data[i];
+        frame[i + 3] = data[i];
 
-    return notifyChrValue(HB_MIC, packet, len + 1);
+    return notifyChrValue(HB_NUS_TX, frame, len + 3);
 }
 
 void VoiceBLEService::onDataWritten(const microbit_ble_evt_write_t *params) {
-    if (params->handle == valueHandle(HB_SPEAKER)) {
-        if (!ttsReceiving || params->len < 2)
+    if (params->handle != valueHandle(HB_NUS_RX) || params->len < 1)
+        return;
+
+    const uint8_t *data = params->data;
+    const uint16_t len = params->len;
+    const uint8_t frameType = data[0];
+
+    if (frameType == HB_FRAME_HELLO) {
+        // HELLO is the first application write. The PC must already have enabled
+        // TX notifications, otherwise READY could never be delivered. This also
+        // makes an accidental write from a generic NUS client insufficient to
+        // enter the interactive state.
+        sessionReadyFlag = (
+            len >= 2 &&
+            data[1] == HYPERBIT_PROTOCOL_VERSION &&
+            notifyChrValueEnabled(HB_NUS_TX)
+        );
+        if (!sessionReadyFlag)
+            abortTts();
+        return;
+    }
+
+    // Ignore application data until the PC has completed the explicit HELLO
+    // handshake. A raw BLE connection alone is not a HyperBit session.
+    if (!sessionReadyFlag || !notifyChrValueEnabled(HB_NUS_TX))
+        return;
+
+    if (frameType == HB_FRAME_TTS) {
+        if (!ttsReceiving || len < 3)
             return;
 
-        uint8_t seq = params->data[0];
-        expectedSpeakerSeq = seq + 1;
+        const uint8_t seq = data[1];
+        int payload = data[2];
+        if (payload > HYPERBIT_NUS_AUDIO_PAYLOAD)
+            payload = HYPERBIT_NUS_AUDIO_PAYLOAD;
+        if (payload > (int)len - 3)
+            payload = (int)len - 3;
 
-        int payload = params->len - 1;
+        if (seq != expectedSpeakerSeq) {
+            abortTts();
+            sendControl(HB_EVT_TTS_SEGMENT_DONE, 0);
+            return;
+        }
+        expectedSpeakerSeq = (uint8_t)(seq + 1);
+
         int room = HYPERBIT_MAX_TTS_ADPCM - ttsLen;
         if (payload > room)
             payload = room;
 
         for (int i = 0; i < payload; ++i)
-            TTS_BUFFER[ttsLen++] = params->data[i + 1];
+            TTS_BUFFER[ttsLen++] = data[i + 3];
 
         return;
     }
 
-    if (params->handle == valueHandle(HB_CONTROL) && params->len >= 1) {
-        uint8_t code = params->data[0];
+    if (frameType != HB_FRAME_CONTROL || len < 2)
+        return;
 
-        if (code == HB_CMD_TTS_START) {
+    const uint8_t code = data[1];
+
+    if (code == HB_CMD_TTS_START) {
+        abortTts();
+        ttsReceiving = true;
+        if (len >= 4)
+            ttsExpectedLen = data[2] | (data[3] << 8);
+        if (ttsExpectedLen > HYPERBIT_MAX_TTS_ADPCM) {
             abortTts();
-            ttsReceiving = true;
-            if (params->len >= 3)
-                ttsExpectedLen = params->data[1] | (params->data[2] << 8);
-            if (params->len >= 4)
-                ttsFirstSegmentFlag = (params->data[3] & 0x01) != 0;
+            sendControl(HB_EVT_TTS_SEGMENT_DONE, 0);
             return;
         }
+        if (len >= 5)
+            ttsFirstSegmentFlag = (data[4] & 0x01) != 0;
+        return;
+    }
 
-        if (code == HB_CMD_TTS_END) {
-            ttsReceiving = false;
-            if (ttsExpectedLen == 0 || ttsLen == ttsExpectedLen) {
-                ttsReadyFlag = true;
-            } else {
-                abortTts();
-                sendControl(HB_EVT_TTS_SEGMENT_DONE, 0);
-            }
+    if (code == HB_CMD_TTS_END) {
+        // An earlier sequence/length fault calls abortTts(), which clears the
+        // lengths. The PC may already have queued TTS_END, so never let that
+        // stale end frame turn an aborted zero-length receive into success.
+        if (!ttsReceiving)
             return;
-        }
 
-        if (code == HB_CMD_TTS_ABORT) {
+        ttsReceiving = false;
+        if (ttsLen == ttsExpectedLen) {
+            ttsReadyFlag = true;
+        } else {
             abortTts();
-            return;
+            sendControl(HB_EVT_TTS_SEGMENT_DONE, 0);
         }
+        return;
+    }
 
-        if (code == HB_CMD_SET_STATE && params->len >= 2) {
-            pcStateValue = params->data[1];
-            return;
-        }
+    if (code == HB_CMD_TTS_ABORT) {
+        abortTts();
+        return;
+    }
+
+    if (code == HB_CMD_SET_STATE && len >= 3) {
+        pcStateValue = data[2];
+        return;
     }
 }
