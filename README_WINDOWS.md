@@ -29,6 +29,8 @@ Use the latest GitHub Release and keep its PC files and firmware together:
 - Wukong 4 Rainbow LEDs = state colors via CODAL hardware PWM
 - Wukong battery = wireless power
 
+The micro:bit V2 application MCU is Nordic's **nRF52833**, a 64 MHz Cortex-M4F with 512 KiB flash and 128 KiB RAM. Those resources are shared by CODAL, SoftDevice reservations, heap/stack, buffers, and the application.
+
 ### Windows PC
 
 - Bleak = BLE/NUS transport
@@ -54,18 +56,28 @@ Windows raw BLE link
     -> PC validates firmware
 ```
 
-The current hardened firmware is protocol **v2**, revision **r4**. The PC requires the r4 buffered-HVN capability, so a stale r3 HEX is rejected explicitly.
+The current hardened firmware is protocol **v2**, revision **r5**. The PC requires buffered-HVN and bounded-link-recovery capabilities, so an older HEX is rejected explicitly.
 
-While that handshake is in progress, the micro:bit 5×5 display is deliberately **black**: firmware disables the matrix refresh driver and performs no fluid animation, accelerometer reads, Wukong updates, microphone work, speaker work, or button handling. Normal visuals resume only after READY has successfully been queued.
+While raw GATT setup is in progress, r5 **freezes the last rendered 5×5 frame without disabling CODAL's LED-matrix hardware**. It schedules no new fluid animation, accelerometer reads, Wukong writes, microphone work, speaker work, or button handling until READY succeeds. Keeping the TIMER4 display lifecycle stable removes the previous disable/re-enable recovery failure surface.
 
-If Windows leaves a half-open raw connection, firmware evicts it after about 45 seconds. If an already-valid voice session later disconnects, the PC agent automatically scans and reconnects.
+If Windows leaves a raw connection half-open, firmware allows roughly 38 seconds for the 35-second GATT setup window, requests a normal GAP disconnect, then gives the SoftDevice about two seconds to report the link gone. If it still claims to be connected, the MCU/SoftDevice resets so the board cannot remain trapped indefinitely.
+
+After that recovery window, the PC performs a fresh BLE scan and reacquires the board before creating the next `BleakClient`, instead of repeatedly using the WinRT `BLEDevice` object associated with the failed GATT session.
+
+If an already-valid voice session later disconnects, the PC agent automatically scans and reconnects. Delayed callbacks from superseded Bleak clients are ignored so they cannot kill a newer healthy session.
+
+## Animation/resource behavior
+
+Routine matrix animation is 25 Hz in r5 rather than roughly 33 Hz. The five-particle fluid renderer uses fixed-point integer state, and accelerometer data is sampled only for disconnected/idle fluid states. Listening, uploading, transcription, thinking, speaking, error, and muted shapes do not perform gravity reads they cannot use.
+
+The size of `HyperBit.hex` in Explorer is not the linked application flash usage. Intel HEX is an ASCII container and the release image includes non-application regions. Use `BUILD_PROVENANCE.txt` from the release for actual linked application flash/static-RAM/heap measurements.
 
 ## Audio transport
 
 Audio is 8 kHz mono IMA ADPCM.
 
 - Microphone: streamed while the gold logo is held through a 512-byte ring buffer and <=20-byte BLE frames.
-- Firmware r4: a reviewed build-time CODAL override configures a 12-entry SoftDevice GATTS notification queue before BLE is enabled.
+- Firmware: a reviewed build-time CODAL override configures a 12-entry SoftDevice GATTS notification queue before BLE is enabled.
 - TTS: continuous ADPCM stream split into acknowledged <=512-byte segments, then <=20-byte BLE frames.
 - The PC checks mic sequence numbers and warns if a packet gap/overflow makes an utterance incomplete.
 
@@ -101,7 +113,7 @@ py -3 HyperBit.py --ble-test
 
 ## Building firmware locally
 
-`BUILD_FIRMWARE.bat` now mirrors the release build instead of simply reusing whatever CODAL tree happens to exist. It resets the sample checkout, removes generated build/dependency trees, CMake-configures the locked CODAL revision, applies `firmware/apply_codal_overrides.py`, then compiles.
+`BUILD_FIRMWARE.bat` mirrors the release build instead of simply reusing whatever CODAL tree happens to exist. It resets the sample checkout, removes generated build/dependency trees, CMake-configures the locked CODAL revision, applies `firmware/apply_codal_overrides.py`, then compiles.
 
 The override pins the reviewed CODAL commit and moves both the application RAM boundary and the 16-byte NOINIT region out of the expanded SoftDevice reservation. It refuses to patch an unexpected upstream revision or source anchor.
 
