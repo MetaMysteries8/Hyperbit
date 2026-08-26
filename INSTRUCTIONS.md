@@ -40,9 +40,11 @@ This mode requires **no Hyper API key**. It tests only:
 - protocol + firmware revision + capability validation,
 - a two-second post-handshake stability window.
 
-A current board should report **protocol v2, firmware revision r4 or newer, and the buffered-HVN capability**.
+A current board should report **protocol v2, firmware revision r5 or newer, buffered-HVN, and bounded-link-recovery capabilities**.
 
-During the raw connection/handshake window the 5×5 display intentionally goes **black**. Firmware disables the matrix refresh driver and does no animation, accelerometer, Wukong, microphone, speaker, or button work until READY has been successfully queued. That is deliberate connection isolation, not a frozen fluid renderer.
+During raw Bluetooth/GATT setup the 5×5 face intentionally **freezes on its last rendered frame**. r5 no longer disables/re-enables the V2 LED-matrix hardware. Instead, it stops scheduling new animation, accelerometer, Wukong, microphone, speaker, and button work until READY succeeds. The frozen frame during the attempt is deliberate; remaining frozen forever after a failed attempt is not.
+
+If Windows leaves a raw link half-open, r5 gives the 35-second GATT window roughly 38 seconds, requests a normal disconnect, then gives the SoftDevice about two seconds to confirm it. If the link still claims to exist, the micro:bit resets itself so normal boot/fluid behavior and advertising are guaranteed to return. The PC then rescans and reacquires a fresh Windows BLEDevice before retrying.
 
 If `TEST_BLE.bat` fails, copy the `[ble]` output. You can also target one board explicitly:
 
@@ -89,11 +91,13 @@ HyperBit uses both parts of Wukong's lighting hardware:
 
 The 5×5 matrix and Wukong lights show disconnected, idle, listening, uploading, transcribing, thinking, speaking, muted, and error states. Rainbow state updates do not use the old interrupt-masking bit-banger.
 
+Routine matrix animation is 25 Hz in r5. The accelerometer is sampled only for disconnected/idle fluid states; non-fluid shapes do not spend peripheral time on gravity data they do not use.
+
 ## 7. Audio transport
 
 HyperBit does not store a whole conversation-sized audio file on the micro:bit.
 
-Microphone audio is 8 kHz mono IMA ADPCM streamed as tiny BLE packets while the logo is held through a 512-byte ring buffer. Firmware r4 also configures a 12-entry Nordic SoftDevice notification queue so brief Windows connection-event scheduling gaps do not immediately force the application into one-packet-at-a-time backpressure.
+Microphone audio is 8 kHz mono IMA ADPCM streamed as tiny BLE packets while the logo is held through a 512-byte ring buffer. The firmware configures a 12-entry Nordic SoftDevice notification queue so brief Windows connection-event scheduling gaps do not immediately force the application into one-packet-at-a-time backpressure.
 
 TTS is split by the PC into at most 512 ADPCM bytes per acknowledged segment, with each segment further divided into <=20-byte NUS frames.
 
@@ -103,11 +107,17 @@ If the microphone transport still cannot keep up, the firmware/PC marks the utte
 
 After a valid voice session has connected, an unexpected Bluetooth disconnect no longer leaves the agent stuck waiting forever. The PC agent notices the session loss, closes the stale client, scans again, and keeps retrying until the board returns or you press Ctrl+C.
 
-Firmware also evicts a raw half-open Windows connection after about 45 seconds so the board can advertise again.
+Firmware r5 also prevents failed GATT setup from owning the board forever: raw half-open links receive a bounded disconnect window followed by a hardware reset fallback if the SoftDevice never reports the connection gone.
 
-## 9. Building locally
+## 9. Hardware budget
 
-Normal users should use the compiled release HEX. If you intentionally build from source, `BUILD_FIRMWARE.bat` now reproduces the release build order:
+micro:bit V2 uses a 64 MHz Nordic nRF52833 with 512 KiB flash and 128 KiB RAM. Those resources are shared by CODAL, SoftDevice reservations, application heap/stack, audio buffers, and peripherals.
+
+Do not infer flash usage from the size of `HyperBit.hex` in Windows Explorer. Intel HEX is an ASCII container and the release image includes non-application regions. Read `BUILD_PROVENANCE.txt` from the same release for the actual linked application flash/static-RAM/heap measurements.
+
+## 10. Building locally
+
+Normal users should use the compiled release HEX. If you intentionally build from source, `BUILD_FIRMWARE.bat` reproduces the release build order:
 
 1. reset the official `microbit-v2-samples` checkout,
 2. remove stale generated `build/` and `libraries/` trees,
@@ -124,6 +134,7 @@ Use this order so failures stay isolated:
 
 1. Confirm Wukong boot self-test.
 2. Flash the `HyperBit.hex` from the same release ZIP as the PC agent.
-3. Run `TEST_BLE.bat` until protocol v2 / firmware r4 validation is stable.
-4. Only then configure the Hyper API key and run full voice mode.
-5. If full mode fails after BLE passes, the problem is above the transport layer (dependencies, Whisper, Hyper API, or TTS) rather than firmware discovery.
+3. Run `TEST_BLE.bat` until protocol v2 / firmware r5 validation is stable.
+4. During a failed GATT attempt, confirm the face eventually returns/reboots instead of remaining permanently frozen.
+5. Only then configure the Hyper API key and run full voice mode.
+6. If full mode fails after BLE passes, the problem is above the transport layer (dependencies, Whisper, Hyper API, or TTS) rather than firmware discovery.
