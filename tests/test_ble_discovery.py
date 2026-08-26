@@ -106,6 +106,28 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(transport.firmware_revision, ble_link.MIN_FIRMWARE_REVISION)
         self.assertEqual(transport.capabilities, caps)
 
+    async def test_superseded_disconnect_callback_cannot_kill_current_session(self):
+        transport = ble_link.HyperBitBLE()
+        transport._loop = asyncio.get_running_loop()
+        old_client = object()
+        current_client = object()
+        transport.client = current_client
+        transport._session_active = True
+
+        transport._on_disconnected(old_client)
+        await asyncio.sleep(0)
+
+        self.assertTrue(transport._session_active)
+        self.assertFalse(transport._disconnect_event.is_set())
+        self.assertFalse(transport._cancel.is_set())
+
+        transport._on_disconnected(current_client)
+        await asyncio.sleep(0)
+
+        self.assertFalse(transport._session_active)
+        self.assertTrue(transport._disconnect_event.is_set())
+        self.assertTrue(transport._cancel.is_set())
+
     def test_retry_logic_uses_preserved_candidate_classification(self):
         source = (PC_AGENT / "ble_link.py").read_text(encoding="utf-8")
         self.assertIn("candidate.is_microbit", source)
