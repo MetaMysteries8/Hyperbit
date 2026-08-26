@@ -18,6 +18,12 @@ Keep the `HyperBit.hex` and PC files from the **same release** together. The PC 
 4. Run `RUN_HYPERBIT.bat`; on first normal run it creates private `config.cmd` for your Hyper key.
 5. Run `RUN_HYPERBIT.bat` again for full voice mode.
 
+## Hardware budget
+
+micro:bit V2 uses Nordic's **nRF52833**: a 64 MHz Cortex-M4F with **512 KiB flash and 128 KiB RAM**. HyperBit treats that as a shared embedded budget for CODAL, SoftDevice reservations, application heap/stack, buffers, and peripherals rather than assuming desktop-class resources.
+
+The on-disk size of `HyperBit.hex` is not the linked application flash usage. Intel HEX is an ASCII container and the release image contains non-application regions required by the micro:bit. Each release's `BUILD_PROVENANCE.txt` records the real linked application flash/static-RAM/heap measurements.
+
 ## What the physical device does
 
 The **V2 gold capacitive logo at the top** is push-to-talk. The microphone hardware is deactivated at rest, activated while the logo is held, and deactivated again on release.
@@ -60,13 +66,17 @@ raw BLE connection
   -> PC validates identity
 ```
 
-Current hardened firmware is **protocol v2 / revision r4**. Revision r4 adds a required buffered-notification capability for microphone streaming.
+Current hardened firmware is **protocol v2 / revision r5**. Revision r5 adds bounded half-open-link recovery on top of the buffered-notification transport introduced in r4.
 
-At 8 kHz / 4-bit IMA ADPCM, the microphone produces about 4,000 compressed bytes per second. Protocol-v2 frames carry 17 audio bytes each, requiring roughly 236 notifications per second while speaking. Nordic S113 defaults to only one queued server notification, so the r4 build configures a **12-entry GATTS notification queue** and reserves additional lower RAM for the SoftDevice before it is enabled. The 512-byte microphone ring remains a second backpressure layer.
+At 8 kHz / 4-bit IMA ADPCM, the microphone produces about 4,000 compressed bytes per second. Protocol-v2 frames carry 17 audio bytes each, requiring roughly 236 notifications per second while speaking. Nordic S113 defaults to only one queued server notification, so the build configures a **12-entry GATTS notification queue** and reserves additional lower RAM for the SoftDevice before it is enabled. The 512-byte microphone ring remains a second backpressure layer.
 
-During the raw connection and handshake, the micro:bit's 5×5 display is intentionally **black**. Firmware disables display refresh and performs no animation, accelerometer reads, Wukong updates, microphone work, speaker work, or button processing until READY has successfully been queued. Connection setup gets exclusive priority.
+During raw connection/GATT setup, r5 **freezes the currently rendered 5x5 frame without disabling CODAL's LED-matrix driver**. It schedules no new face animation, accelerometer reads, Wukong writes, microphone work, speaker work, or button processing until READY has successfully been queued. This preserves connection isolation while keeping the V2 TIMER4 display lifecycle stable.
 
-Half-open raw connections are evicted after about 45 seconds. Once a voice session has been validated, an unexpected disconnect is detected by the PC agent and automatically retried instead of leaving the program stuck waiting forever.
+A half-open raw connection is bounded: firmware gives Windows roughly 38 seconds for its 35-second GATT window, requests a GAP disconnect, and then gives the SoftDevice about two seconds to report the disconnect. If the link still claims to exist, r5 resets the MCU/SoftDevice so the board cannot remain trapped forever. The PC then rescans and reacquires a fresh Windows BLEDevice before retrying rather than repeatedly reusing the object associated with the failed GATT session.
+
+Routine animation is now 25 Hz and the accelerometer is sampled only for disconnected/idle fluid states. This preserves the five-particle fluid effect while reducing unnecessary peripheral/scheduler work on the 64 MHz MCU.
+
+Once a voice session has been validated, an unexpected disconnect is detected by the PC agent and automatically retried instead of leaving the program stuck waiting forever.
 
 ## BLE-only diagnostics
 

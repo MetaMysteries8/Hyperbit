@@ -232,8 +232,14 @@ jobs:
 
           PROTOCOL_VERSION="$(awk '$1 == "#define" && $2 == "HYPERBIT_PROTOCOL_VERSION" {print $3}' firmware/source/VoiceBLEService.h)"
           FIRMWARE_REVISION="$(awk '$1 == "#define" && $2 == "HYPERBIT_FIRMWARE_REVISION" {print $3}' firmware/source/VoiceBLEService.h)"
-          test "$PROTOCOL_VERSION" = "2"
-          test "$FIRMWARE_REVISION" = "4"
+          PC_PROTOCOL_VERSION="$(awk '$1 == "PROTOCOL_VERSION" && $2 == "=" {print $3}' pc_agent/ble_link.py)"
+          PC_MIN_FIRMWARE_REVISION="$(awk '$1 == "MIN_FIRMWARE_REVISION" && $2 == "=" {print $3}' pc_agent/ble_link.py)"
+          test -n "$PROTOCOL_VERSION"
+          test -n "$FIRMWARE_REVISION"
+          test -n "$PC_PROTOCOL_VERSION"
+          test -n "$PC_MIN_FIRMWARE_REVISION"
+          test "$PROTOCOL_VERSION" = "$PC_PROTOCOL_VERSION"
+          test "$FIRMWARE_REVISION" = "$PC_MIN_FIRMWARE_REVISION"
 
           FIRMWARE_TREE_SHA="$(find firmware/source -maxdepth 1 -type f -printf '%f\0' | sort -z | while IFS= read -r -d '' f; do sha256sum "firmware/source/$f"; done | sha256sum | awk '{print $1}')"
           {
@@ -312,6 +318,7 @@ jobs:
           - Non-IRQ-masking hardware-PWM Rainbow-driver verification.
           - Successful GNU Arm micro:bit V2 firmware compilation.
           - Linked application-boundary and minimum 64 KiB heap-capacity verification.
+          - Firmware/PC protocol and minimum-revision contract verification.
 
           Release build: ${GITHUB_RUN_NUMBER}
           Commit: ${GITHUB_SHA}
@@ -336,6 +343,9 @@ jobs:
       - name: Prepare release notes
         shell: bash
         run: |
+          set -euo pipefail
+          PROTOCOL_VERSION="$(awk '$1 == "#define" && $2 == "HYPERBIT_PROTOCOL_VERSION" {print $3}' firmware/source/VoiceBLEService.h)"
+          FIRMWARE_REVISION="$(awk '$1 == "#define" && $2 == "HYPERBIT_FIRMWARE_REVISION" {print $3}' firmware/source/VoiceBLEService.h)"
           cat > dist/RELEASE_NOTES.md <<EOF
           # HyperBit automated build ${GITHUB_RUN_NUMBER}
 
@@ -350,7 +360,7 @@ jobs:
 
           ## Transport revision
 
-          Firmware revision 4 keeps protocol v2/NUS framing but adds a verified 12-entry SoftDevice notification queue and conservative lower-RAM reservation for streamed microphone audio. The PC agent requires this buffered-transport capability so stale firmware is rejected explicitly.
+          Firmware revision ${FIRMWARE_REVISION} uses protocol v${PROTOCOL_VERSION}/NUS framing, retains the verified buffered-notification transport, and adds bounded recovery for half-open Windows BLE sessions. During GATT setup the firmware freezes application animation without disabling the V2 LED-matrix driver; if a half-open link will not disconnect cleanly, the firmware resets the MCU/SoftDevice so Windows can reacquire a fresh device.
 
           ## Diagnostics
 

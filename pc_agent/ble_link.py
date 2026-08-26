@@ -17,13 +17,19 @@ FRAME_MIC = 0xA1
 FRAME_TTS = 0xA2
 FRAME_HELLO = 0xA3
 PROTOCOL_VERSION = 2
-MIN_FIRMWARE_REVISION = 4
+MIN_FIRMWARE_REVISION = 5
 
 CAP_CONNECTION_ISOLATION = 0x01
 CAP_SAFE_RAINBOW_PWM = 0x02
 CAP_SEGMENTED_TTS = 0x04
 CAP_BUFFERED_HVN = 0x08
-REQUIRED_CAPABILITIES = CAP_CONNECTION_ISOLATION | CAP_SEGMENTED_TTS | CAP_BUFFERED_HVN
+CAP_BOUNDED_LINK_RECOVERY = 0x10
+REQUIRED_CAPABILITIES = (
+    CAP_CONNECTION_ISOLATION
+    | CAP_SEGMENTED_TTS
+    | CAP_BUFFERED_HVN
+    | CAP_BOUNDED_LINK_RECOVERY
+)
 
 AUDIO_PAYLOAD_BYTES = 17
 
@@ -50,7 +56,11 @@ STATE_ERROR = 6
 
 TTS_SEGMENT_BYTES = 512
 GATT_CONNECT_TIMEOUT_SECONDS = 35.0
-GATT_RECOVERY_WAIT_SECONDS = 15.0
+GATT_RECOVERY_WAIT_SECONDS = 8.0
+# Firmware gives a half-open raw link ~38s before requesting disconnect and
+# another ~2s before target_reset(). Leave a small boot/advertising margin.
+FIRMWARE_RECOVERY_DEADLINE_SECONDS = 42.0
+RECOVERY_RESCAN_SECONDS = 5.0
 HELLO_TIMEOUT_SECONDS = 5.0
 
 
@@ -113,6 +123,22 @@ class HyperBitBLE:
                 queue.get_nowait()
             except asyncio.QueueEmpty:
                 return
+
+    @staticmethod
+    def _retry_wait_seconds(attempt_elapsed_seconds: float, disconnect_confirmed: bool) -> float:
+        """Return a retry delay that cannot outrun firmware half-open recovery.
+
+        If Windows completed an explicit disconnect, the short debounce is enough.
+        Otherwise `is_connected == False` is not proof that the peripheral saw a
+        disconnect: WinRT can abandon GATT setup while the micro:bit still holds a
+        raw link. In that ambiguous case, wait until the firmware watchdog/reset
+        deadline measured from the start of the failed attempt.
+        """
+        if disconnect_confirmed:
+            return GATT_RECOVERY_WAIT_SECONDS
+        elapsed = max(0.0, attempt_elapsed_seconds)
+        remaining = FIRMWARE_RECOVERY_DEADLINE_SECONDS - elapsed
+        return max(GATT_RECOVERY_WAIT_SECONDS, remaining)
 
     def _reset_runtime_state(self):
         self._recv.clear()
@@ -204,6 +230,55 @@ class HyperBitBLE:
             print(f"  [{index}] {candidate.display_name} ({candidate.device.address}) [{kind}]")
         return unique
 
+    async def _refresh_candidate(self, candidate: Candidate) -> Candidate:
+        """Reacquire a fresh Windows BLEDevice after a recovery/reset window.
+
+        A micro:bit reset keeps the same on-air identity, but the WinRT object used
+        by a timed-out GATT session can be stale. Prefer the same address; when no
+        explicit address was requested, allow the same advertised micro:bit name
+        as a fallback. If scanning misses the board, keep the old object so the
+        retry remains no worse than the previous behavior.
+        """
+        try:
+            found = await BleakScanner.discover(
+                timeout=RECOVERY_RESCAN_SECONDS,
+                return_adv=True,
+            )
+        except Exception as exc:
+            print(f"[ble] recovery rescan failed ({type(exc).__name__}); reusing prior device object")
+            return candidate
+
+        address = candidate.device.address.lower()
+        name_fallback = None
+        for _key, pair in found.items():
+            device, adv = pair
+            display_name = adv.local_name or device.name or ""
+            refreshed = Candidate(
+                device,
+                display_name or candidate.display_name,
+                candidate.is_microbit or self._looks_like_microbit(display_name),
+            )
+            if device.address.lower() == address:
+                print(f"[ble] recovery rescan reacquired {refreshed.display_name} ({device.address})")
+                return refreshed
+            if (
+                not self.address
+                and candidate.is_microbit
+                and display_name
+                and display_name.lower() == candidate.display_name.lower()
+            ):
+                name_fallback = refreshed
+
+        if name_fallback is not None:
+            print(
+                f"[ble] recovery rescan reacquired micro:bit by name at "
+                f"{name_fallback.device.address}"
+            )
+            return name_fallback
+
+        print("[ble] recovery rescan did not see the board; reusing prior device object")
+        return candidate
+
     def _mark_unexpected_disconnect(self, source_client=None):
         # Bleak may deliver a disconnect callback after a timed-out/partial client
         # has already been replaced by a later successful connection attempt.
@@ -221,7 +296,13 @@ class HyperBitBLE:
         if self._loop is not None:
             self._loop.call_soon_threadsafe(self._mark_unexpected_disconnect, client)
 
-    async def _disconnect_partial(self):
+    async def _disconnect_partial(self) -> bool:
+        """Best-effort setup teardown; return True only for a confirmed disconnect.
+
+        A false WinRT `is_connected` after a failed GATT operation is ambiguous: the
+        peripheral can still have a raw link. Only report success when we observed
+        a connected client and its explicit disconnect completed and cleared state.
+        """
         self._session_active = False
         client = self.client
         self.client = None
@@ -229,12 +310,14 @@ class HyperBitBLE:
         self.rx_char = None
         self._ready.clear()
         if not client:
-            return
+            return False
         try:
-            if client.is_connected:
-                await asyncio.wait_for(client.disconnect(), timeout=5.0)
+            if not client.is_connected:
+                return False
+            await asyncio.wait_for(client.disconnect(), timeout=5.0)
+            return not client.is_connected
         except Exception:
-            pass
+            return False
 
     def _resolve_nus_chars(self):
         assert self.client is not None
@@ -264,27 +347,39 @@ class HyperBitBLE:
             raise
 
     async def _try_candidate(self, candidate: Candidate, candidate_index: int, candidate_count: int):
-        dev = candidate.device
-        # Service migration makes stale Windows caches especially unhelpful. Start
-        # uncached, recover uncached once more, then keep cache as a final fallback.
+        current_candidate = candidate
+        # Start uncached. After each firmware recovery window, reacquire the
+        # peripheral from a fresh Windows scan before creating another client.
         attempts = [
             (False, "fresh/uncached services"),
             (False, "fresh/uncached services after firmware recovery"),
             (True, "Windows cached-services fallback"),
         ]
         last_error: BaseException | None = None
+        last_attempt_started: float | None = None
+        last_disconnect_confirmed = False
+        clock = asyncio.get_running_loop()
 
         for attempt, (use_cache, label) in enumerate(attempts, 1):
             if attempt > 1:
+                assert last_attempt_started is not None
+                elapsed = clock.time() - last_attempt_started
+                recovery_wait = self._retry_wait_seconds(elapsed, last_disconnect_confirmed)
+                reason = "confirmed disconnect" if last_disconnect_confirmed else "firmware watchdog"
                 print(
-                    f"[ble] retry {attempt}/{len(attempts)} for {dev.address}: "
-                    f"waiting {GATT_RECOVERY_WAIT_SECONDS:.0f}s for BLE recovery..."
+                    f"[ble] retry {attempt}/{len(attempts)} for "
+                    f"{current_candidate.device.address}: waiting "
+                    f"{recovery_wait:.0f}s ({reason}) before recovery rescan..."
                 )
-                await asyncio.sleep(GATT_RECOVERY_WAIT_SECONDS)
+                await asyncio.sleep(recovery_wait)
+                current_candidate = await self._refresh_candidate(current_candidate)
 
+            last_attempt_started = clock.time()
+            last_disconnect_confirmed = False
+            dev = current_candidate.device
             print(
                 f"[ble] candidate {candidate_index}/{candidate_count}: connecting to "
-                f"{candidate.display_name} ({dev.address}) using {label}"
+                f"{current_candidate.display_name} ({dev.address}) using {label}"
             )
 
             self.client = BleakClient(
@@ -301,13 +396,13 @@ class HyperBitBLE:
                 chars = self._resolve_nus_chars()
                 if chars is None:
                     print("[ble] candidate has no usable Nordic UART Service")
-                    await self._disconnect_partial()
+                    last_disconnect_confirmed = await self._disconnect_partial()
                     if use_cache:
                         return False, RuntimeError("Nordic UART Service is missing")
                     continue
 
                 self.tx_char, self.rx_char = chars
-                self._loop = asyncio.get_running_loop()
+                self._loop = clock
                 self._ready.clear()
                 self._ready_error = None
 
@@ -319,16 +414,16 @@ class HyperBitBLE:
 
                 try:
                     await asyncio.wait_for(self._ready.wait(), timeout=HELLO_TIMEOUT_SECONDS)
-                except asyncio.TimeoutError as exc:
+                except asyncio.TimeoutError:
                     last_error = RuntimeError(
                         "NUS connected, but this device did not answer HyperBit HELLO"
                     )
-                    await self._disconnect_partial()
+                    last_disconnect_confirmed = await self._disconnect_partial()
 
-                    # Preserve the classification obtained from adv.local_name.
+                    # Preserve the classification obtained from advertisement data.
                     # Generic NUS devices get one identity attempt; likely
-                    # micro:bits and explicit hints receive the recovery retries.
-                    if not candidate.is_microbit and not self.address and not self.name_hint:
+                    # micro:bits and explicit hints receive recovery retries.
+                    if not current_candidate.is_microbit and not self.address and not self.name_hint:
                         print("[ble] generic NUS device did not answer HyperBit HELLO; moving on")
                         return False, last_error
                     continue
@@ -336,7 +431,7 @@ class HyperBitBLE:
                 if self._ready_error:
                     last_error = RuntimeError(self._ready_error)
                     print(f"[ble] candidate rejected: {self._ready_error}")
-                    await self._disconnect_partial()
+                    last_disconnect_confirmed = await self._disconnect_partial()
                     # A stale HyperBit is definitely the selected device; repeating
                     # the same incompatible handshake will not repair its firmware.
                     return False, last_error
@@ -357,19 +452,19 @@ class HyperBitBLE:
             except BLEDisconnectedError as exc:
                 last_error = exc
                 print(f"[ble] session dropped during setup: {exc}")
-                await self._disconnect_partial()
+                last_disconnect_confirmed = await self._disconnect_partial()
             except (TimeoutError, asyncio.TimeoutError) as exc:
                 last_error = exc
                 print("[ble] Windows timed out while establishing the BLE service session.")
-                await self._disconnect_partial()
+                last_disconnect_confirmed = await self._disconnect_partial()
             except RuntimeError as exc:
                 last_error = exc
                 print(f"[ble] session attempt failed: {exc}")
-                await self._disconnect_partial()
+                last_disconnect_confirmed = await self._disconnect_partial()
             except Exception as exc:
                 last_error = exc
                 print(f"[ble] connection attempt failed: {type(exc).__name__}: {exc}")
-                await self._disconnect_partial()
+                last_disconnect_confirmed = await self._disconnect_partial()
 
         return False, last_error
 
@@ -394,9 +489,10 @@ class HyperBitBLE:
 
         raise RuntimeError(
             "Windows found Bluetooth candidates but none established a usable HyperBit NUS "
-            "HELLO/READY session. If a candidate reports an old firmware revision, flash the "
-            "HyperBit.hex from the same release ZIP as this PC agent. Otherwise a timeout on "
-            "a BBC micro:bit candidate points at the BLE/runtime layer, not fluid rendering."
+            "HELLO/READY session. Firmware r5+ self-recovers half-open links and the PC "
+            "reacquires a fresh Windows BLEDevice before retries. If this still times out "
+            "on a BBC micro:bit candidate, the next diagnostic target is the underlying "
+            "CODAL/SoftDevice GATT path rather than the fluid renderer."
         ) from last_error
 
     def _nus_notify(self, _sender, data: bytearray):

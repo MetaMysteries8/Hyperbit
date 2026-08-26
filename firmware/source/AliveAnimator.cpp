@@ -138,8 +138,9 @@ void AliveAnimator::renderFluid(int ax, int ay, bool dimmer) {
 void AliveAnimator::renderConnecting() {
     clearMatrix();
 
-    // Retained for diagnostics/manual use, but the production connection path
-    // disables the matrix refresh hardware entirely until READY is delivered.
+    // Retained for diagnostics/manual use. Production connection setup freezes
+    // the last fluid frame and stops animator.tick(), so this normally does not
+    // execute during fragile Windows service discovery.
     static const uint8_t path[12][2] = {
         {2,0},{3,0},{4,1},{4,2},{4,3},{3,4},
         {2,4},{1,4},{0,3},{0,2},{0,1},{1,0}
@@ -283,15 +284,24 @@ void AliveAnimator::tick() {
     ++frame;
 
     // Keep this path before ANY accelerometer or Wukong access. Production raw
-    // connection setup disables display refresh entirely, but this remains safe
-    // if PHYS_CONNECTING is ever rendered manually.
+    // connection setup does not call tick() at all, but this remains safe if
+    // PHYS_CONNECTING is ever rendered manually.
     if (stateValue == PHYS_CONNECTING) {
         renderConnecting();
         return;
     }
 
-    int ax = bit.accelerometer.getX();
-    int ay = bit.accelerometer.getY();
+    // The accelerometer is needed only by the gravity/fluid states. Avoid even
+    // reading it for listening/thinking/speaking/busy shapes; on a 64 MHz
+    // nRF52833 there is no reason to spend peripheral/scheduler work on data the
+    // renderer will throw away.
+    int ax = 0;
+    int ay = 0;
+    if (stateValue == PHYS_DISCONNECTED || stateValue == PHYS_IDLE) {
+        ax = bit.accelerometer.getX();
+        ay = bit.accelerometer.getY();
+    }
+
     uint8_t activeLevel = stateValue == PHYS_LISTENING ? inputLevelValue : outputLevelValue;
 
     if (mutedValue && stateValue != PHYS_LISTENING && stateValue != PHYS_UPLOADING) {

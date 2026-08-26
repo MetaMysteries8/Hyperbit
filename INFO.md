@@ -4,6 +4,8 @@ HyperBit is a PC-hosted voice AI agent with a **BBC micro:bit V2 + ELECFREAKS Wu
 
 ## micro:bit V2
 
+The V2 application processor is Nordic's nRF52833: a 64 MHz Cortex-M4F with 512 KiB flash and 128 KiB RAM. That is the entire MCU budget shared by the application, CODAL runtime, stacks/heaps, buffers, and BLE SoftDevice reservations, so HyperBit treats peripheral scheduling and BLE lifecycle as constrained resources rather than assuming desktop-class headroom.
+
 - Gold capacitive logo = push-to-talk.
 - Built-in microphone = speech capture.
 - Built-in speaker = spoken responses.
@@ -13,6 +15,8 @@ HyperBit is a PC-hosted voice AI agent with a **BBC micro:bit V2 + ELECFREAKS Wu
 - BLE = bidirectional compressed audio/control over Nordic UART Service.
 
 The microphone hardware is activated only while the gold logo is held.
+
+The size of `HyperBit.hex` on disk is **not** the amount of application flash consumed: Intel HEX is an ASCII container and the release image also contains non-application regions required by the micro:bit. `BUILD_PROVENANCE.txt` records the linked application flash/static-RAM/heap measurements for each build and is the source of truth for resource headroom.
 
 ## Wukong
 
@@ -43,11 +47,23 @@ HyperBit uses the standard Nordic UART Service UUID layout rather than the earli
 
 BLE/GATT still exists underneath because it is the application-data mechanism exposed by the micro:bit SoftDevice and Windows BLE APIs, but HyperBit no longer invents a bespoke GATT shape.
 
-The PC subscribes to NUS TX and sends a protocol HELLO. Firmware accepts HELLO only after notifications are enabled, then reports protocol version, firmware revision, and capability bits in READY. The current hardened firmware is protocol v2 / revision r4. The PC requires the buffered-HVN capability and rejects stale firmware instead of silently attempting to debug an old HEX.
+The PC subscribes to NUS TX and sends a protocol HELLO. Firmware accepts HELLO only after notifications are enabled, then reports protocol version, firmware revision, and capability bits in READY. The current hardened firmware is protocol v2 / revision r5. The PC requires buffered-HVN and bounded-link-recovery capabilities and rejects stale firmware instead of silently attempting to debug an old HEX.
 
-During a raw Bluetooth connection, the 5×5 display refresh driver is cleared and disabled. Firmware performs no face animation, accelerometer reads, Wukong updates, microphone work, speaker work, or button interaction until READY has successfully been queued. Connection setup gets priority over personality.
+### Connection isolation and recovery
 
-A half-open connection is evicted after about 45 seconds. After a valid session, an unexpected disconnect is surfaced to the Windows agent and normal voice mode automatically reconnects.
+During a raw Bluetooth connection, HyperBit **freezes the current 5x5 frame without disabling the V2 LED-matrix driver**. No new face animation, accelerometer reads, Wukong writes, microphone work, speaker work, or button handling is scheduled until READY has successfully been queued. This keeps application work out of fragile GATT setup while avoiding a disable/re-enable lifecycle for CODAL's TIMER4-driven display hardware.
+
+A raw connection that never reaches READY is bounded. Firmware gives Windows' 35-second GATT setup window roughly 38 seconds, requests a normal GAP disconnect, then gives the SoftDevice about two more seconds to deliver the disconnect event. If the link still claims to be present, r5 performs an MCU/SoftDevice reset so the board cannot remain permanently trapped in a half-open connection state. Boot then restores normal Wukong/fluid behavior and advertising.
+
+On recovery retries the Windows client performs a fresh BLE scan and reacquires the device before creating another `BleakClient`, rather than repeatedly using the WinRT `BLEDevice` object associated with the failed GATT session.
+
+After a valid session, an unexpected disconnect is surfaced to the Windows agent and normal voice mode automatically reconnects. Delayed disconnect callbacks from superseded WinRT clients are ignored so they cannot tear down a newer healthy session.
+
+## Animation/resource policy
+
+The fluid effect is deliberately small: five fixed-point particles. r5 runs routine matrix animation at 25 Hz rather than roughly 33 Hz and samples the accelerometer only in disconnected/idle fluid states. Listening, uploading, transcription, thinking, speaking, error, and muted shapes do not perform gravity reads they cannot use. Wukong I2C brightness updates remain rate-limited and state-color Rainbow updates use hardware PWM.
+
+This preserves the friendly physical behavior while reducing routine scheduler/peripheral pressure on the 64 MHz MCU.
 
 ## Audio transport
 
@@ -55,7 +71,7 @@ Audio is 8 kHz mono IMA ADPCM.
 
 Input is streamed in BLE-sized chunks while push-to-talk is held. At 4 bits per sample this produces about 4,000 compressed bytes per second. Protocol v2 carries up to 17 audio bytes in each 20-byte NUS notification, so continuous input needs roughly 236 notifications per second.
 
-The Nordic S113 default server-notification queue is only one entry. Firmware r4's reproducible build therefore applies a reviewed **12-entry GATTS notification queue** before the SoftDevice is enabled and reserves additional lower nRF52833 RAM for that configuration. The 512-byte microphone ring is retained as a second backpressure layer. Temporary queue exhaustion is retried; a sustained transport/ring overflow is explicitly reported with the utterance.
+The Nordic S113 default server-notification queue is only one entry. HyperBit's reproducible build therefore applies a reviewed **12-entry GATTS notification queue** before the SoftDevice is enabled and reserves additional lower nRF52833 RAM for that configuration. The 512-byte microphone ring is retained as a second backpressure layer. Temporary queue exhaustion is retried; a sustained transport/ring overflow is explicitly reported with the utterance.
 
 Output is segmented into <=512-byte ADPCM pieces, then each piece is packetized into <=20-byte NUS frames and acknowledged before the next piece is sent.
 
