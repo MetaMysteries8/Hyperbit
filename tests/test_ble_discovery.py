@@ -22,6 +22,17 @@ class _ClientStub:
     pass
 
 
+class _DisconnectClient:
+    def __init__(self, connected=True, fail=False):
+        self.is_connected = connected
+        self.fail = fail
+
+    async def disconnect(self):
+        if self.fail:
+            raise RuntimeError("disconnect failed")
+        self.is_connected = False
+
+
 fake_bleak = types.ModuleType("bleak")
 fake_bleak.BleakScanner = _ScannerStub
 fake_bleak.BleakClient = _ClientStub
@@ -94,6 +105,36 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(refreshed, original)
 
+    async def test_partial_disconnect_reports_only_confirmed_disconnect(self):
+        transport = ble_link.HyperBitBLE()
+
+        clean = _DisconnectClient(connected=True)
+        transport.client = clean
+        self.assertTrue(await transport._disconnect_partial())
+        self.assertFalse(clean.is_connected)
+        self.assertIsNone(transport.client)
+
+        failed = _DisconnectClient(connected=True, fail=True)
+        transport.client = failed
+        self.assertFalse(await transport._disconnect_partial())
+        self.assertTrue(failed.is_connected)
+        self.assertIsNone(transport.client)
+
+        ambiguous = _DisconnectClient(connected=False)
+        transport.client = ambiguous
+        self.assertFalse(await transport._disconnect_partial())
+        self.assertIsNone(transport.client)
+
+    def test_retry_wait_covers_firmware_watchdog_if_disconnect_is_ambiguous(self):
+        wait = ble_link.HyperBitBLE._retry_wait_seconds(2.0, False)
+        self.assertEqual(wait, ble_link.FIRMWARE_RECOVERY_DEADLINE_SECONDS - 2.0)
+
+        near_deadline = ble_link.HyperBitBLE._retry_wait_seconds(35.0, False)
+        self.assertEqual(near_deadline, ble_link.GATT_RECOVERY_WAIT_SECONDS)
+
+        clean = ble_link.HyperBitBLE._retry_wait_seconds(1.0, True)
+        self.assertEqual(clean, ble_link.GATT_RECOVERY_WAIT_SECONDS)
+
     async def test_stale_firmware_ready_is_rejected_immediately(self):
         transport = ble_link.HyperBitBLE()
         transport._loop = asyncio.get_running_loop()
@@ -157,6 +198,7 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("current_candidate.is_microbit", source)
         self.assertNotIn("looks_like_microbit = self._looks_like_microbit(dev.name", source)
         self.assertIn("current_candidate = await self._refresh_candidate(current_candidate)", source)
+        self.assertIn("_retry_wait_seconds(elapsed, last_disconnect_confirmed)", source)
 
 
 if __name__ == "__main__":

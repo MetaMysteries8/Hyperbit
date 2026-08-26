@@ -57,6 +57,9 @@ STATE_ERROR = 6
 TTS_SEGMENT_BYTES = 512
 GATT_CONNECT_TIMEOUT_SECONDS = 35.0
 GATT_RECOVERY_WAIT_SECONDS = 8.0
+# Firmware gives a half-open raw link ~38s before requesting disconnect and
+# another ~2s before target_reset(). Leave a small boot/advertising margin.
+FIRMWARE_RECOVERY_DEADLINE_SECONDS = 42.0
 RECOVERY_RESCAN_SECONDS = 5.0
 HELLO_TIMEOUT_SECONDS = 5.0
 
@@ -120,6 +123,22 @@ class HyperBitBLE:
                 queue.get_nowait()
             except asyncio.QueueEmpty:
                 return
+
+    @staticmethod
+    def _retry_wait_seconds(attempt_elapsed_seconds: float, disconnect_confirmed: bool) -> float:
+        """Return a retry delay that cannot outrun firmware half-open recovery.
+
+        If Windows completed an explicit disconnect, the short debounce is enough.
+        Otherwise `is_connected == False` is not proof that the peripheral saw a
+        disconnect: WinRT can abandon GATT setup while the micro:bit still holds a
+        raw link. In that ambiguous case, wait until the firmware watchdog/reset
+        deadline measured from the start of the failed attempt.
+        """
+        if disconnect_confirmed:
+            return GATT_RECOVERY_WAIT_SECONDS
+        elapsed = max(0.0, attempt_elapsed_seconds)
+        remaining = FIRMWARE_RECOVERY_DEADLINE_SECONDS - elapsed
+        return max(GATT_RECOVERY_WAIT_SECONDS, remaining)
 
     def _reset_runtime_state(self):
         self._recv.clear()
@@ -277,7 +296,13 @@ class HyperBitBLE:
         if self._loop is not None:
             self._loop.call_soon_threadsafe(self._mark_unexpected_disconnect, client)
 
-    async def _disconnect_partial(self):
+    async def _disconnect_partial(self) -> bool:
+        """Best-effort setup teardown; return True only for a confirmed disconnect.
+
+        A false WinRT `is_connected` after a failed GATT operation is ambiguous: the
+        peripheral can still have a raw link. Only report success when we observed
+        a connected client and its explicit disconnect completed and cleared state.
+        """
         self._session_active = False
         client = self.client
         self.client = None
@@ -285,12 +310,14 @@ class HyperBitBLE:
         self.rx_char = None
         self._ready.clear()
         if not client:
-            return
+            return False
         try:
-            if client.is_connected:
-                await asyncio.wait_for(client.disconnect(), timeout=5.0)
+            if not client.is_connected:
+                return False
+            await asyncio.wait_for(client.disconnect(), timeout=5.0)
+            return not client.is_connected
         except Exception:
-            pass
+            return False
 
     def _resolve_nus_chars(self):
         assert self.client is not None
@@ -329,17 +356,26 @@ class HyperBitBLE:
             (True, "Windows cached-services fallback"),
         ]
         last_error: BaseException | None = None
+        last_attempt_started: float | None = None
+        last_disconnect_confirmed = False
+        clock = asyncio.get_running_loop()
 
         for attempt, (use_cache, label) in enumerate(attempts, 1):
             if attempt > 1:
+                assert last_attempt_started is not None
+                elapsed = clock.time() - last_attempt_started
+                recovery_wait = self._retry_wait_seconds(elapsed, last_disconnect_confirmed)
+                reason = "confirmed disconnect" if last_disconnect_confirmed else "firmware watchdog"
                 print(
                     f"[ble] retry {attempt}/{len(attempts)} for "
                     f"{current_candidate.device.address}: waiting "
-                    f"{GATT_RECOVERY_WAIT_SECONDS:.0f}s for firmware BLE recovery..."
+                    f"{recovery_wait:.0f}s ({reason}) before recovery rescan..."
                 )
-                await asyncio.sleep(GATT_RECOVERY_WAIT_SECONDS)
+                await asyncio.sleep(recovery_wait)
                 current_candidate = await self._refresh_candidate(current_candidate)
 
+            last_attempt_started = clock.time()
+            last_disconnect_confirmed = False
             dev = current_candidate.device
             print(
                 f"[ble] candidate {candidate_index}/{candidate_count}: connecting to "
@@ -360,13 +396,13 @@ class HyperBitBLE:
                 chars = self._resolve_nus_chars()
                 if chars is None:
                     print("[ble] candidate has no usable Nordic UART Service")
-                    await self._disconnect_partial()
+                    last_disconnect_confirmed = await self._disconnect_partial()
                     if use_cache:
                         return False, RuntimeError("Nordic UART Service is missing")
                     continue
 
                 self.tx_char, self.rx_char = chars
-                self._loop = asyncio.get_running_loop()
+                self._loop = clock
                 self._ready.clear()
                 self._ready_error = None
 
@@ -382,7 +418,7 @@ class HyperBitBLE:
                     last_error = RuntimeError(
                         "NUS connected, but this device did not answer HyperBit HELLO"
                     )
-                    await self._disconnect_partial()
+                    last_disconnect_confirmed = await self._disconnect_partial()
 
                     # Preserve the classification obtained from advertisement data.
                     # Generic NUS devices get one identity attempt; likely
@@ -395,7 +431,7 @@ class HyperBitBLE:
                 if self._ready_error:
                     last_error = RuntimeError(self._ready_error)
                     print(f"[ble] candidate rejected: {self._ready_error}")
-                    await self._disconnect_partial()
+                    last_disconnect_confirmed = await self._disconnect_partial()
                     # A stale HyperBit is definitely the selected device; repeating
                     # the same incompatible handshake will not repair its firmware.
                     return False, last_error
@@ -416,19 +452,19 @@ class HyperBitBLE:
             except BLEDisconnectedError as exc:
                 last_error = exc
                 print(f"[ble] session dropped during setup: {exc}")
-                await self._disconnect_partial()
+                last_disconnect_confirmed = await self._disconnect_partial()
             except (TimeoutError, asyncio.TimeoutError) as exc:
                 last_error = exc
                 print("[ble] Windows timed out while establishing the BLE service session.")
-                await self._disconnect_partial()
+                last_disconnect_confirmed = await self._disconnect_partial()
             except RuntimeError as exc:
                 last_error = exc
                 print(f"[ble] session attempt failed: {exc}")
-                await self._disconnect_partial()
+                last_disconnect_confirmed = await self._disconnect_partial()
             except Exception as exc:
                 last_error = exc
                 print(f"[ble] connection attempt failed: {type(exc).__name__}: {exc}")
-                await self._disconnect_partial()
+                last_disconnect_confirmed = await self._disconnect_partial()
 
         return False, last_error
 
