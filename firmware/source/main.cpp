@@ -8,6 +8,7 @@
 #include "ImaAdpcm.h"
 #include "ble.h"
 #include "ble_hci.h"
+#include "codal_target_hal.h"
 
 using namespace codal;
 MicroBit uBit;
@@ -169,23 +170,6 @@ static bool stateIsBusyForPtt(uint8_t state) {
            state == PHYS_SPEAKING;
 }
 
-static void suspendDisplayForConnection(bool &displaySuspended) {
-    if (displaySuspended)
-        return;
-    uBit.display.clear();
-    uBit.display.disable();
-    displaySuspended = true;
-}
-
-static void resumeDisplayAfterConnection(bool &displaySuspended) {
-    if (!displaySuspended)
-        return;
-    uBit.display.enable();
-    uBit.display.setDisplayMode(DISPLAY_MODE_GREYSCALE);
-    uBit.display.clear();
-    displaySuspended = false;
-}
-
 int main() {
     uBit.init();
 
@@ -230,7 +214,6 @@ int main() {
 
     bool lastRawConnected = false;
     bool applicationReady = false;
-    bool displaySuspended = false;
     bool pttActive = false;
     bool lastA = false;
     bool lastB = false;
@@ -244,10 +227,17 @@ int main() {
     int interruptGraceTicks = 0;
     int animationDivider = 0;
 
-    // Windows can leave a raw BLE link half-open. The 45-second limit covers
-    // Windows' own discovery timeout while guaranteeing eventual recovery.
+    // Windows may leave a raw BLE link present even after Bleak has abandoned
+    // service discovery. Do not let that half-open state own the board forever.
+    // Bleak's connect window is 35 s; give it ~38 s, request a normal disconnect,
+    // then allow 2 s for the SoftDevice disconnect event. If that event never
+    // arrives, reset the MCU/SoftDevice so advertising and the creature UI are
+    // guaranteed to recover before the PC's next retry.
     int halfOpenTicks = 0;
-    const int HALF_OPEN_LIMIT_TICKS = 4500; // ~45 seconds at 10 ms/tick
+    int disconnectGraceTicks = 0;
+    bool recoveryDisconnectPending = false;
+    const int HALF_OPEN_LIMIT_TICKS = 3800;       // ~38 s at 10 ms/tick
+    const int DISCONNECT_GRACE_TICKS = 200;       // ~2 s at 10 ms/tick
 
     while (true) {
         bool rawConnected = voice.getConnected();
@@ -256,11 +246,16 @@ int main() {
             lastRawConnected = rawConnected;
             applicationReady = false;
             halfOpenTicks = 0;
+            disconnectGraceTicks = 0;
+            recoveryDisconnectPending = false;
 
             if (rawConnected) {
-                // Connection first, personality second: shut off the refresh
-                // driver before Windows finishes GATT discovery/CCCD setup.
-                suspendDisplayForConnection(displaySuspended);
+                // Freeze the current face, but DO NOT disable/re-enable the V2
+                // LED-matrix driver. CODAL supports TIMER4 display refresh while
+                // BLE is active. We simply stop animator.tick() so connection
+                // setup has no accelerometer, Wukong, mic, speaker or animation
+                // work while keeping the display driver in a stable lifecycle.
+                animator.setState(PHYS_CONNECTING);
             } else {
                 if (pttActive) {
                     recorder.stop();
@@ -268,7 +263,6 @@ int main() {
                 }
                 uBit.audio.deactivateMic();
                 voice.abortTts();
-                resumeDisplayAfterConnection(displaySuspended);
                 animator.setState(PHYS_DISCONNECTED);
                 lastPcState = 255;
             }
@@ -278,19 +272,35 @@ int main() {
         // the isolated handshake state rather than continuing a half-session.
         if (rawConnected && applicationReady && !voice.notificationsReady()) {
             applicationReady = false;
-            suspendDisplayForConnection(displaySuspended);
+            halfOpenTicks = 0;
+            disconnectGraceTicks = 0;
+            recoveryDisconnectPending = false;
+            animator.setState(PHYS_CONNECTING);
         }
 
         if (rawConnected && !applicationReady) {
-            if (++halfOpenTicks >= HALF_OPEN_LIMIT_TICKS) {
-                disconnectCurrentConnection(voice);
-                halfOpenTicks = 0;
+            if (recoveryDisconnectPending) {
+                if (++disconnectGraceTicks >= DISCONNECT_GRACE_TICKS) {
+                    // A half-open link that survives an explicit GAP disconnect
+                    // is not a state worth trying to repair in-place. Resetting
+                    // also clears stale SoftDevice/GATT state before Windows
+                    // retries, and boot re-establishes the normal fluid UI.
+                    target_reset();
+                }
                 uBit.sleep(10);
                 continue;
             }
 
-            // HELLO is not sufficient: remain black/peripheral-free until READY
-            // itself is successfully queued to the subscribed TX characteristic.
+            if (++halfOpenTicks >= HALF_OPEN_LIMIT_TICKS) {
+                disconnectCurrentConnection(voice);
+                recoveryDisconnectPending = true;
+                disconnectGraceTicks = 0;
+                uBit.sleep(10);
+                continue;
+            }
+
+            // HELLO is not sufficient: keep every application peripheral idle
+            // until READY itself is successfully queued to subscribed TX.
             if (!voice.notificationsReady()) {
                 uBit.sleep(10);
                 continue;
@@ -307,7 +317,8 @@ int main() {
 
             applicationReady = true;
             halfOpenTicks = 0;
-            resumeDisplayAfterConnection(displaySuspended);
+            disconnectGraceTicks = 0;
+            recoveryDisconnectPending = false;
             animator.setState(PHYS_IDLE);
             lastPcState = 255;
 
@@ -317,10 +328,11 @@ int main() {
         }
 
         if (!applicationReady) {
-            // Disconnected animation is allowed; raw-connected handshakes have
-            // already continued above with the matrix physically disabled.
+            // Disconnected mode animates at 25 Hz. A raw-connected handshake
+            // intentionally freezes the last rendered frame; the display timer
+            // remains enabled, but no new animation/peripheral work is scheduled.
             if (!rawConnected) {
-                if (++animationDivider >= 3) {
+                if (++animationDivider >= 4) {
                     animationDivider = 0;
                     animator.tick();
                 }
@@ -464,7 +476,9 @@ int main() {
             }
         }
 
-        if (++animationDivider >= 3) {
+        // 25 Hz is plenty for a 5x5 matrix and materially reduces routine
+        // animation/peripheral scheduling load compared with the previous ~33 Hz.
+        if (++animationDivider >= 4) {
             animationDivider = 0;
             if (pttActive)
                 animator.setInputLevel(recorder.level());
