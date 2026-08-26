@@ -204,7 +204,12 @@ class HyperBitBLE:
             print(f"  [{index}] {candidate.display_name} ({candidate.device.address}) [{kind}]")
         return unique
 
-    def _mark_unexpected_disconnect(self):
+    def _mark_unexpected_disconnect(self, source_client=None):
+        # Bleak may deliver a disconnect callback after a timed-out/partial client
+        # has already been replaced by a later successful connection attempt.
+        # Never let that stale callback tear down the newer validated session.
+        if source_client is not None and self.client is not source_client:
+            return
         if self._closing or not self._session_active:
             return
         self._session_active = False
@@ -212,9 +217,9 @@ class HyperBitBLE:
         self._disconnect_event.set()
         print("[ble] HyperBit disconnected unexpectedly")
 
-    def _on_disconnected(self, _client):
+    def _on_disconnected(self, client):
         if self._loop is not None:
-            self._loop.call_soon_threadsafe(self._mark_unexpected_disconnect)
+            self._loop.call_soon_threadsafe(self._mark_unexpected_disconnect, client)
 
     async def _disconnect_partial(self):
         self._session_active = False
