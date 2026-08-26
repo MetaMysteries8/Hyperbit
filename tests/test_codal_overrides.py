@@ -51,9 +51,14 @@ class CodalOverrideTests(unittest.TestCase):
         self.assertIsNotNone(
             re.search(r"^CAP_BUFFERED_HVN\s*=\s*0x08\s*$", PC, re.M)
         )
-        required = re.search(r"^REQUIRED_CAPABILITIES\s*=\s*(.+)$", PC, re.M)
-        self.assertIsNotNone(required)
-        self.assertIn("CAP_BUFFERED_HVN", required.group(1))
+
+        # REQUIRED_CAPABILITIES is intentionally formatted over several lines.
+        # Parse the complete assignment block rather than assuming a one-line RHS.
+        required_start = PC.index("REQUIRED_CAPABILITIES =")
+        required_end = PC.index("AUDIO_PAYLOAD_BYTES", required_start)
+        required_block = PC[required_start:required_end]
+        self.assertIn("CAP_BUFFERED_HVN", required_block)
+        self.assertIn("CAP_BOUNDED_LINK_RECOVERY", required_block)
 
 
 if __name__ == "__main__":
