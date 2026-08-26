@@ -83,10 +83,26 @@ class ProtocolContractTests(unittest.TestCase):
     def test_half_open_ble_recovery_is_bounded_and_hard_fails_safe(self):
         self.assertIn("HALF_OPEN_LIMIT_TICKS = 3800", MAIN)
         self.assertIn("DISCONNECT_GRACE_TICKS = 200", MAIN)
-        disconnect = MAIN.index("disconnectCurrentConnection(voice);", MAIN.index("HALF_OPEN_LIMIT_TICKS"))
-        reset = MAIN.index("target_reset();", disconnect)
-        self.assertLess(disconnect, reset)
-        self.assertIn("recoveryDisconnectPending", MAIN[disconnect:reset])
+
+        # Runtime order spans multiple loop iterations: first the half-open timer
+        # requests a disconnect and sets recoveryDisconnectPending; on later
+        # iterations the pending branch counts its grace window and resets only if
+        # the SoftDevice still reports the raw link. Validate those two states
+        # independently instead of incorrectly requiring their source-text order.
+        handshake_start = MAIN.index("if (rawConnected && !applicationReady)")
+        handshake_end = MAIN.index("if (!applicationReady)", handshake_start)
+        handshake = MAIN[handshake_start:handshake_end]
+
+        pending_start = handshake.index("if (recoveryDisconnectPending)")
+        half_open_start = handshake.index("if (++halfOpenTicks >= HALF_OPEN_LIMIT_TICKS)")
+        pending_block = handshake[pending_start:half_open_start]
+        half_open_block = handshake[half_open_start:]
+
+        self.assertIn("++disconnectGraceTicks >= DISCONNECT_GRACE_TICKS", pending_block)
+        self.assertIn("target_reset();", pending_block)
+        self.assertIn("disconnectCurrentConnection(voice);", half_open_block)
+        self.assertIn("recoveryDisconnectPending = true;", half_open_block)
+        self.assertIn("disconnectGraceTicks = 0;", half_open_block)
 
     def test_idle_animation_is_specs_aware(self):
         # 25 Hz instead of ~33 Hz, and accelerometer reads only feed fluid states.
