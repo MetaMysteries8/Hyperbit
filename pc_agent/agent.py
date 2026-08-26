@@ -4,6 +4,12 @@ import argparse
 import asyncio
 import os
 
+# Install Windows/Bleak compatibility before importing transport symbols. Both
+# RUN_AGENT.bat and the packaged HyperBit.py launcher execute this file, so the
+# workaround must live here rather than in only one outer launcher.
+import winrt_ble_compat
+winrt_ble_compat.install()
+
 from audio_codec import decode_ima_adpcm
 from ble_link import (
     BLEDisconnectedError,
