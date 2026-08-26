@@ -70,6 +70,30 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(candidates), 1)
         self.assertFalse(candidates[0].is_microbit)
 
+    async def test_recovery_rescan_reacquires_fresh_device_by_address(self):
+        old_dev = _Device("AA:BB:CC:DD:EE:03", name="BBC micro:bit [test]")
+        new_dev = _Device("AA:BB:CC:DD:EE:03", name=None)
+        adv = _Adv(local_name="BBC micro:bit [test]", service_uuids=[])
+        _ScannerStub.found = {"fresh": (new_dev, adv)}
+
+        transport = ble_link.HyperBitBLE()
+        original = ble_link.Candidate(old_dev, "BBC micro:bit [test]", True)
+        refreshed = await transport._refresh_candidate(original)
+
+        self.assertIs(refreshed.device, new_dev)
+        self.assertEqual(refreshed.display_name, "BBC micro:bit [test]")
+        self.assertTrue(refreshed.is_microbit)
+
+    async def test_recovery_rescan_keeps_old_object_if_board_is_missing(self):
+        old_dev = _Device("AA:BB:CC:DD:EE:04", name="BBC micro:bit [test]")
+        _ScannerStub.found = {}
+
+        transport = ble_link.HyperBitBLE()
+        original = ble_link.Candidate(old_dev, "BBC micro:bit [test]", True)
+        refreshed = await transport._refresh_candidate(original)
+
+        self.assertIs(refreshed, original)
+
     async def test_stale_firmware_ready_is_rejected_immediately(self):
         transport = ble_link.HyperBitBLE()
         transport._loop = asyncio.get_running_loop()
@@ -130,8 +154,9 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
 
     def test_retry_logic_uses_preserved_candidate_classification(self):
         source = (PC_AGENT / "ble_link.py").read_text(encoding="utf-8")
-        self.assertIn("candidate.is_microbit", source)
+        self.assertIn("current_candidate.is_microbit", source)
         self.assertNotIn("looks_like_microbit = self._looks_like_microbit(dev.name", source)
+        self.assertIn("current_candidate = await self._refresh_candidate(current_candidate)", source)
 
 
 if __name__ == "__main__":
