@@ -19,9 +19,8 @@ if not ENTRYPOINT.is_file():
 sys.path.insert(0, str(PC_AGENT))
 
 try:
-    import winrt_ble_compat
-
-    winrt_ble_compat.install()
+    # agent.py owns transport compatibility setup so every supported launcher,
+    # including RUN_AGENT.bat, follows the exact same Windows BLE path.
     runpy.run_path(str(ENTRYPOINT), run_name="__main__")
 except ModuleNotFoundError as exc:
     missing = exc.name or "a Python dependency"
