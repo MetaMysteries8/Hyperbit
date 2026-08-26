@@ -33,8 +33,8 @@ if not defined BLE_TEST (
 )
 
 set "PYTHON_CMD="
-set "IMPORT_CHECK=import bleak, httpx, numpy, psutil, faster_whisper"
-if defined BLE_TEST set "IMPORT_CHECK=import bleak"
+set "IMPORT_CHECK=import bleak, httpx, numpy, psutil, faster_whisper; import importlib.metadata as m; assert tuple(map(int,m.version('bleak').split('.')[:3])) >= (2,1,1)"
+if defined BLE_TEST set "IMPORT_CHECK=import bleak; import importlib.metadata as m; assert tuple(map(int,m.version('bleak').split('.')[:3])) >= (2,1,1)"
 
 where python3 >nul 2>nul
 if not errorlevel 1 (
@@ -60,8 +60,8 @@ if not defined PYTHON_CMD (
 
 if not defined PYTHON_CMD (
     echo.
-    echo HyperBit dependencies were not found in any Python installation.
-    echo Installing requirements into the first Python I can find...
+    echo HyperBit dependencies are missing or the installed Bleak is too old.
+    echo Installing/upgrading requirements into the first Python I can find...
     echo.
 
     where python3 >nul 2>nul
@@ -83,7 +83,7 @@ if not defined PYTHON_CMD (
         exit /b 1
     )
 
-    %PYTHON_CMD% -m pip install -r requirements.txt
+    %PYTHON_CMD% -m pip install --upgrade -r requirements.txt
     if errorlevel 1 (
         echo Dependency installation failed.
         pause
