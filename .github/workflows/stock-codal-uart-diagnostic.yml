@@ -1,0 +1,166 @@
+name: Stock CODAL UART Diagnostic
+
+on:
+  push:
+    branches:
+      - stock-codal-uart-diagnostic
+    paths:
+      - diagnostics/stock_codal_uart/**
+      - .github/workflows/stock-codal-uart-diagnostic.yml
+  pull_request:
+    paths:
+      - diagnostics/stock_codal_uart/**
+      - .github/workflows/stock-codal-uart-diagnostic.yml
+
+permissions:
+  contents: write
+
+jobs:
+  build-diagnostic:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout HyperBit
+        uses: actions/checkout@v4
+
+      - name: Install ARM/CODAL build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi binutils-arm-none-eabi cmake ninja-build git zip
+
+      - name: Python syntax check
+        run: python3 -m py_compile diagnostics/stock_codal_uart/TEST_STOCK_CODAL_BLE.py
+
+      - name: Fetch exact micro:bit V2 sample tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .build dist
+          mkdir -p .build dist
+          git init .build/base
+          git -C .build/base remote add origin https://github.com/lancaster-university/microbit-v2-samples.git
+          git -C .build/base fetch --depth 1 origin 04b7089d82af24534f3dcd460a9c343850b60b5d
+          git -C .build/base checkout --detach FETCH_HEAD
+          test "$(git -C .build/base rev-parse HEAD)" = "04b7089d82af24534f3dcd460a9c343850b60b5d"
+
+      - name: Build open-link and pairing stock CODAL UART images
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EXPECTED_CODAL=26af67ef621b8d99d8be1722ea6e09f3387301a4
+
+          build_variant() {
+            local variant="$1"
+            local config="$2"
+            local output="$3"
+            local root=".build/${variant}"
+
+            cp -a .build/base "$root"
+            rm -rf "$root/source"/*
+            cp diagnostics/stock_codal_uart/main.cpp "$root/source/main.cpp"
+            cp "diagnostics/stock_codal_uart/${config}" "$root/codal.json"
+
+            cmake -S "$root" -B "$root/build" -DCMAKE_BUILD_TYPE=RelWithDebInfo -G Ninja \
+              2>&1 | tee "dist/${variant}-configure.log"
+
+            local target="$root/libraries/codal-microbit-v2"
+            test "$(git -C "$target" rev-parse HEAD)" = "$EXPECTED_CODAL"
+
+            # This diagnostic is only useful if CODAL is genuinely unmodified.
+            ! grep -Fq 'HYPERBIT_CODAL_OVERRIDE' "$target/source/bluetooth/MicroBitBLEManager.cpp"
+            ! grep -Fq 'HYPERBIT_UART_NOTIFY_OVERRIDE' "$target/source/bluetooth/MicroBitUARTService.cpp"
+
+            cmake --build "$root/build" --parallel 10 2>&1 | tee "dist/${variant}-build.log"
+            test -f "$root/MICROBIT.hex"
+            cp "$root/MICROBIT.hex" "dist/${output}"
+
+            {
+              echo "variant=${variant}"
+              echo "samples_commit=$(git -C "$root" rev-parse HEAD)"
+              echo "codal_commit=$(git -C "$target" rev-parse HEAD)"
+              echo "codal_uart_sha256=$(sha256sum "$target/source/bluetooth/MicroBitUARTService.cpp" | awk '{print $1}')"
+              echo "ble_manager_sha256=$(sha256sum "$target/source/bluetooth/MicroBitBLEManager.cpp" | awk '{print $1}')"
+              echo "hex_sha256=$(sha256sum "dist/${output}" | awk '{print $1}')"
+              echo
+            } >> dist/DIAGNOSTIC_PROVENANCE.txt
+          }
+
+          build_variant open codal-open.json CODAL-UART-OPEN.hex
+          build_variant pairing codal-pairing.json CODAL-UART-PAIRING.hex
+
+      - name: Verify diagnostic does not contain HyperBit firmware transport code
+        shell: bash
+        run: |
+          set -euo pipefail
+          ! grep -R -F 'VoiceBLEService' diagnostics/stock_codal_uart/main.cpp diagnostics/stock_codal_uart/codal-*.json
+          ! grep -R -F 'HYPERBIT_CODAL_OVERRIDE' .build/open/libraries/codal-microbit-v2/source/bluetooth .build/pairing/libraries/codal-microbit-v2/source/bluetooth
+          ! grep -R -F 'HYPERBIT_UART_NOTIFY_OVERRIDE' .build/open/libraries/codal-microbit-v2/source/bluetooth .build/pairing/libraries/codal-microbit-v2/source/bluetooth
+          grep -Fq 'new MicroBitUARTService(*uBit.ble, 32, 32);' diagnostics/stock_codal_uart/main.cpp
+          cat dist/DIAGNOSTIC_PROVENANCE.txt
+
+      - name: Package Windows diagnostic kit
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp diagnostics/stock_codal_uart/TEST_STOCK_CODAL_BLE.py dist/
+          cp diagnostics/stock_codal_uart/TEST_STOCK_CODAL_BLE.bat dist/
+          cp diagnostics/stock_codal_uart/README.md dist/
+
+          cat > dist/RELEASE_NOTES.md <<EOF
+          # Stock CODAL UART isolation diagnostic
+
+          This package removes HyperBit's firmware BLE transport implementation from the test.
+
+          Test in this order:
+          1. Flash `CODAL-UART-OPEN.hex` and run `TEST_STOCK_CODAL_BLE.bat`.
+          2. If GATT discovery is still unreachable, flash `CODAL-UART-PAIRING.hex` and run `TEST_STOCK_CODAL_BLE.bat --pair`.
+
+          Both images use locked codal-microbit-v2 v0.3.4 and upstream MicroBitUARTService directly. No HyperBit CODAL patch, custom notification queue, custom RAM reservation, Wukong, mic, speaker, HELLO/READY framing, or half-open watchdog is present.
+          EOF
+
+          (cd dist && zip -q stock-codal-uart-diagnostic.zip \
+            CODAL-UART-OPEN.hex CODAL-UART-PAIRING.hex \
+            TEST_STOCK_CODAL_BLE.py TEST_STOCK_CODAL_BLE.bat \
+            README.md DIAGNOSTIC_PROVENANCE.txt RELEASE_NOTES.md)
+
+          (cd dist && sha256sum CODAL-UART-OPEN.hex CODAL-UART-PAIRING.hex stock-codal-uart-diagnostic.zip > CHECKSUMS.sha256)
+          cat dist/CHECKSUMS.sha256
+
+      - name: Upload diagnostic artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: stock-codal-uart-diagnostic-${{ github.run_number }}
+          path: |
+            dist/CODAL-UART-OPEN.hex
+            dist/CODAL-UART-PAIRING.hex
+            dist/stock-codal-uart-diagnostic.zip
+            dist/CHECKSUMS.sha256
+            dist/DIAGNOSTIC_PROVENANCE.txt
+            dist/RELEASE_NOTES.md
+            dist/README.md
+            dist/TEST_STOCK_CODAL_BLE.py
+            dist/TEST_STOCK_CODAL_BLE.bat
+            dist/*-configure.log
+            dist/*-build.log
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish diagnostic prerelease
+        if: github.event_name == 'push' && github.ref == 'refs/heads/stock-codal-uart-diagnostic'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="codal-uart-diag-${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" \
+            dist/CODAL-UART-OPEN.hex \
+            dist/CODAL-UART-PAIRING.hex \
+            dist/stock-codal-uart-diagnostic.zip \
+            dist/CHECKSUMS.sha256 \
+            dist/DIAGNOSTIC_PROVENANCE.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Stock CODAL UART Diagnostic ${GITHUB_RUN_NUMBER}" \
+            --notes-file dist/RELEASE_NOTES.md \
+            --prerelease
