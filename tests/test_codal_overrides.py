@@ -8,11 +8,13 @@ CFG_PATH = ROOT / "firmware" / "codal_overrides.json"
 SCRIPT_PATH = ROOT / "firmware" / "apply_codal_overrides.py"
 HEADER_PATH = ROOT / "firmware" / "source" / "VoiceBLEService.h"
 PC_PATH = ROOT / "pc_agent" / "ble_link.py"
+CODAL_JSON_PATH = ROOT / "firmware" / "codal.json"
 
 CFG = json.loads(CFG_PATH.read_text(encoding="utf-8"))
 SCRIPT = SCRIPT_PATH.read_text(encoding="utf-8")
 HEADER = HEADER_PATH.read_text(encoding="utf-8")
 PC = PC_PATH.read_text(encoding="utf-8")
+CODAL_JSON = json.loads(CODAL_JSON_PATH.read_text(encoding="utf-8"))
 
 
 class CodalOverrideTests(unittest.TestCase):
@@ -43,6 +45,15 @@ class CodalOverrideTests(unittest.TestCase):
         self.assertIn("expected exactly one", SCRIPT)
         self.assertIn("review the upstream changes", SCRIPT)
 
+    def test_codal_uart_override_is_nordic_style_notify_and_fail_closed(self):
+        self.assertEqual(CODAL_JSON["config"].get("MICROBIT_BLE_NORDIC_STYLE_UART"), 1)
+        self.assertIn('UART_MARKER = "HYPERBIT_UART_NOTIFY_OVERRIDE"', SCRIPT)
+        self.assertIn("MicroBitUARTService.cpp", SCRIPT)
+        self.assertIn("microbit_propINDICATE", SCRIPT)
+        self.assertIn("microbit_propNOTIFY", SCRIPT)
+        self.assertIn("expected exactly one", SCRIPT)
+        self.assertIn("uart_tx=notify", SCRIPT)
+
     def test_firmware_and_pc_require_buffered_hvn_capability(self):
         self.assertRegex(
             HEADER,
@@ -59,6 +70,17 @@ class CodalOverrideTests(unittest.TestCase):
         required_block = PC[required_start:required_end]
         self.assertIn("CAP_BUFFERED_HVN", required_block)
         self.assertIn("CAP_BOUNDED_LINK_RECOVERY", required_block)
+
+    def test_codal_uart_gatt_capability_is_additive(self):
+        self.assertRegex(
+            HEADER,
+            r"#define\s+HYPERBIT_CAP_CODAL_UART_GATT\s+0x20",
+        )
+        capabilities_line = next(
+            line for line in HEADER.splitlines()
+            if line.startswith("#define HYPERBIT_CAPABILITIES")
+        )
+        self.assertIn("HYPERBIT_CAP_CODAL_UART_GATT", capabilities_line)
 
 
 if __name__ == "__main__":
