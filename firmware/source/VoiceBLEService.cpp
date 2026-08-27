@@ -4,18 +4,15 @@ using namespace codal;
 
 static uint8_t TTS_BUFFER[HYPERBIT_MAX_TTS_ADPCM];
 
-// Nordic UART Service base UUID in human byte order. RegisterBaseUUID() handles
-// the SoftDevice byte order internally.
-static const uint8_t NUS_BASE_UUID[16] = {
-    0x6e,0x40,0x00,0x00,0xb5,0xa3,0xf3,0x93,
-    0xe0,0xa9,0xe5,0x0e,0x24,0xdc,0xca,0x9e
-};
-
-static const uint16_t NUS_SERVICE_UUID = 0x0001;
-static const uint16_t NUS_TX_UUID = 0x0003;
-static const uint16_t NUS_RX_UUID = 0x0002;
+static_assert((int)HB_NUS_TX == (int)MicroBitUARTService::mbbs_cIdxTX,
+              "HyperBit TX index must match CODAL UART TX index");
+static_assert((int)HB_NUS_RX == (int)MicroBitUARTService::mbbs_cIdxRX,
+              "HyperBit RX index must match CODAL UART RX index");
+static_assert((int)HB_CHAR_COUNT == (int)MicroBitUARTService::mbbs_cIdxCOUNT,
+              "HyperBit characteristic count must match CODAL UART service");
 
 VoiceBLEService::VoiceBLEService() :
+    MicroBitUARTService(*MicroBitBLEManager::getInstance()),
     sessionReadyFlag(false),
     ttsReceiving(false),
     ttsReadyFlag(false),
@@ -25,28 +22,9 @@ VoiceBLEService::VoiceBLEService() :
     expectedSpeakerSeq(0),
     pcStateValue(0)
 {
-    RegisterBaseUUID(NUS_BASE_UUID);
-    CreateService(NUS_SERVICE_UUID);
-
-    // Standard NUS shape: one TX notify characteristic and one RX write
-    // characteristic. All HyperBit packet types are multiplexed over these two.
-    CreateCharacteristic(
-        HB_NUS_TX,
-        NUS_TX_UUID,
-        txValue,
-        0,
-        sizeof(txValue),
-        microbit_propNOTIFY
-    );
-
-    CreateCharacteristic(
-        HB_NUS_RX,
-        NUS_RX_UUID,
-        rxValue,
-        0,
-        sizeof(rxValue),
-        microbit_propWRITE | microbit_propWRITE_WITHOUT
-    );
+    // r6 intentionally does not call RegisterBaseUUID(), CreateService() or
+    // CreateCharacteristic(). The locked CODAL MicroBitUARTService constructor
+    // owns the complete NUS GATT registration path.
 }
 
 const uint8_t *VoiceBLEService::ttsData() const {
