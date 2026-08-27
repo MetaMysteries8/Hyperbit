@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 from pathlib import Path
@@ -170,9 +171,15 @@ def apply(samples_root: Path, config_path: Path) -> None:
     if linker_final.count(wanted_noinit) != 1 or linker_final.count(wanted_ram) != 1:
         fail("reserved SoftDevice/application RAM layout did not apply exactly once")
 
+    # The workflow archives codal-override.log, so include the exact patched UART
+    # identity there as an independent provenance record in addition to the
+    # fail-closed source checks above.
+    uart_sha256 = hashlib.sha256(uart.read_bytes()).hexdigest()
+
     print(f"HyperBit CODAL override: codal={actual_commit}")
     print(f"HyperBit CODAL override: hvn_tx_queue_size={queue_size}")
     print("HyperBit CODAL override: uart_tx=notify")
+    print(f"HyperBit CODAL override: patched_uart_sha256={uart_sha256}")
     print(f"HyperBit CODAL override: noinit_origin=0X{noinit_origin:08X}")
     print(f"HyperBit CODAL override: application_ram_origin=0X{app_origin:08X}")
 
