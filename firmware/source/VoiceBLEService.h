@@ -1,6 +1,6 @@
 #pragma once
 #include "MicroBit.h"
-#include "MicroBitBLEService.h"
+#include "MicroBitUARTService.h"
 
 // Keep TTS chunks deliberately small. CODAL's softdevice linker script expands
 // its .heap section to the RAM limit, so the generic linker RAM percentage is
@@ -11,17 +11,22 @@
 #define HYPERBIT_PROTOCOL_VERSION 2
 
 // Protocol v2 stays wire-compatible while the firmware revision identifies the
-// minimum implementation required by the PC. READY reports both revision and
-// capabilities so a stale HEX is rejected instead of being debugged by accident.
-#define HYPERBIT_FIRMWARE_REVISION 5
+// minimum implementation required by the PC. r6 moves NUS GATT registration to
+// CODAL's own MicroBitUARTService so Windows is no longer depending on a
+// HyperBit-authored service/characteristic creation path.
+#define HYPERBIT_FIRMWARE_REVISION 6
 #define HYPERBIT_CAP_CONNECTION_ISOLATION   0x01
 #define HYPERBIT_CAP_SAFE_RAINBOW_PWM       0x02
 #define HYPERBIT_CAP_SEGMENTED_TTS          0x04
 #define HYPERBIT_CAP_BUFFERED_HVN           0x08
 #define HYPERBIT_CAP_BOUNDED_LINK_RECOVERY  0x10
-#define HYPERBIT_CAPABILITIES (HYPERBIT_CAP_CONNECTION_ISOLATION | HYPERBIT_CAP_SAFE_RAINBOW_PWM | HYPERBIT_CAP_SEGMENTED_TTS | HYPERBIT_CAP_BUFFERED_HVN | HYPERBIT_CAP_BOUNDED_LINK_RECOVERY)
+#define HYPERBIT_CAP_CODAL_UART_GATT         0x20
+#define HYPERBIT_CAPABILITIES (HYPERBIT_CAP_CONNECTION_ISOLATION | HYPERBIT_CAP_SAFE_RAINBOW_PWM | HYPERBIT_CAP_SEGMENTED_TTS | HYPERBIT_CAP_BUFFERED_HVN | HYPERBIT_CAP_BOUNDED_LINK_RECOVERY | HYPERBIT_CAP_CODAL_UART_GATT)
 
 enum HyperBitCharIndex {
+    // These deliberately mirror MicroBitUARTService::mbbs_cIdxTX/RX. CODAL owns
+    // the actual characteristic array/handles; HyperBit only layers framing and
+    // application state on top.
     HB_NUS_TX = 0,
     HB_NUS_RX = 1,
     HB_CHAR_COUNT = 2
@@ -52,18 +57,17 @@ enum HyperBitCommand {
     HB_CMD_SET_STATE = 0x40
 };
 
-// HyperBit uses the standard Nordic UART Service UUID layout:
+// HyperBit uses the standard Nordic UART Service UUID layout supplied by
+// CODAL's MicroBitUARTService when MICROBIT_BLE_NORDIC_STYLE_UART is enabled:
 //   service 6e400001-b5a3-f393-e0a9-e50e24dcca9e
 //   RX      6e400002-b5a3-f393-e0a9-e50e24dcca9e (PC -> device)
 //   TX      6e400003-b5a3-f393-e0a9-e50e24dcca9e (device -> PC)
 //
-// We keep a tiny framed protocol on top because audio needs packet boundaries
-// and notification throughput; the old HyperBit-specific 7f9a service is gone.
-class VoiceBLEService : public codal::MicroBitBLEService {
-    uint8_t txValue[20];
-    uint8_t rxValue[20];
-    codal::MicroBitBLEChar chars[HB_CHAR_COUNT];
-
+// The locked CODAL tree is patched fail-closed so that its TX characteristic
+// uses NOTIFY rather than INDICATE. This retains standard NUS semantics and the
+// throughput needed by 8 kHz IMA ADPCM while letting upstream CODAL own UUID,
+// service, characteristic and handle registration.
+class VoiceBLEService : public codal::MicroBitUARTService {
     volatile bool sessionReadyFlag;
     bool ttsReceiving;
     volatile bool ttsReadyFlag;
@@ -79,10 +83,7 @@ protected:
     virtual void onDataWritten(const microbit_ble_evt_write_t *params);
 
 public:
-    VoiceBLEService();
-
-    virtual int characteristicCount() { return HB_CHAR_COUNT; }
-    virtual codal::MicroBitBLEChar *characteristicPtr(int idx) { return &chars[idx]; }
+    explicit VoiceBLEService(codal::BLEDevice &ble);
 
     bool sendControl(uint8_t code, uint8_t a=0, uint8_t b=0, uint8_t c=0);
     bool sendMic(uint8_t seq, const uint8_t *data, int len);
