@@ -53,6 +53,7 @@ class CodalOverrideTests(unittest.TestCase):
         self.assertIn("microbit_propNOTIFY", SCRIPT)
         self.assertIn("expected exactly one", SCRIPT)
         self.assertIn("uart_tx=notify", SCRIPT)
+        self.assertIn("patched_uart_sha256", SCRIPT)
 
     def test_firmware_and_pc_require_buffered_hvn_capability(self):
         self.assertRegex(
