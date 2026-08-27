@@ -7,6 +7,7 @@ from pathlib import Path
 
 
 MARKER = "HYPERBIT_CODAL_OVERRIDE"
+UART_MARKER = "HYPERBIT_UART_NOTIFY_OVERRIDE"
 
 
 def fail(message: str) -> None:
@@ -24,9 +25,10 @@ def apply(samples_root: Path, config_path: Path) -> None:
     cfg = json.loads(config_path.read_text(encoding="utf-8"))
     target = samples_root / "libraries" / "codal-microbit-v2"
     manager = target / "source" / "bluetooth" / "MicroBitBLEManager.cpp"
+    uart = target / "source" / "bluetooth" / "MicroBitUARTService.cpp"
     linker = target / "ld" / "nrf52833-softdevice.ld"
 
-    if not manager.is_file() or not linker.is_file():
+    if not manager.is_file() or not uart.is_file() or not linker.is_file():
         fail(
             "CODAL target files are missing. Run CMake configure first so "
             "microbit-v2-samples fetches its locked dependencies."
@@ -93,6 +95,35 @@ def apply(samples_root: Path, config_path: Path) -> None:
         )
         manager.write_text(manager_text, encoding="utf-8")
 
+    # r6 deliberately delegates UUID/service/characteristic registration to
+    # CODAL's own MicroBitUARTService. Upstream uses INDICATE for TX, while
+    # standard Nordic UART Service and HyperBit's 8 kHz ADPCM transport require
+    # NOTIFY semantics and the multi-entry HVN queue configured above. Patch only
+    # this reviewed property token; all service/UUID/handle construction remains
+    # the locked upstream implementation.
+    uart_text = uart.read_text(encoding="utf-8")
+    upstream_uart_tx = """    CreateCharacteristic( mbbs_cIdxTX, charUUID[ mbbs_cIdxTX],
+                          txBuffer + txBufferSize,
+                          0, MICROBIT_UART_S_ATTRSIZE,
+                          microbit_propINDICATE);"""
+    hyperbit_uart_tx = f"""    // {UART_MARKER}: standard NUS TX notifications for HyperBit streaming.
+    CreateCharacteristic( mbbs_cIdxTX, charUUID[ mbbs_cIdxTX],
+                          txBuffer + txBufferSize,
+                          0, MICROBIT_UART_S_ATTRSIZE,
+                          microbit_propNOTIFY);"""
+
+    if UART_MARKER in uart_text:
+        if uart_text.count(UART_MARKER) != 1 or hyperbit_uart_tx not in uart_text:
+            fail("existing MicroBitUARTService notify override does not match reviewed patch")
+    else:
+        uart_text = replace_exact_once(
+            uart_text,
+            upstream_uart_tx,
+            hyperbit_uart_tx,
+            "MicroBitUARTService TX characteristic",
+        )
+        uart.write_text(uart_text, encoding="utf-8")
+
     linker_text = linker.read_text(encoding="utf-8")
     # Emit one canonical spelling so CI can prove the exact patched boundaries.
     wanted_noinit = (
@@ -124,6 +155,7 @@ def apply(samples_root: Path, config_path: Path) -> None:
     linker.write_text(linker_text, encoding="utf-8")
 
     manager_final = manager.read_text(encoding="utf-8")
+    uart_final = uart.read_text(encoding="utf-8")
     linker_final = linker.read_text(encoding="utf-8")
     queue_line = (
         "hyperbit_gatts_cfg.conn_cfg.params.gatts_conn_cfg.hvn_tx_queue_size = "
@@ -131,11 +163,16 @@ def apply(samples_root: Path, config_path: Path) -> None:
     )
     if manager_final.count(MARKER) != 1 or manager_final.count(queue_line) != 1:
         fail("notification queue override did not apply exactly once")
+    if uart_final.count(UART_MARKER) != 1 or uart_final.count("microbit_propNOTIFY") < 1:
+        fail("CODAL UART notification override did not apply exactly once")
+    if "microbit_propINDICATE);" in uart_final[uart_final.find(UART_MARKER):uart_final.find(UART_MARKER) + 400]:
+        fail("CODAL UART TX still advertises indicate after notify override")
     if linker_final.count(wanted_noinit) != 1 or linker_final.count(wanted_ram) != 1:
         fail("reserved SoftDevice/application RAM layout did not apply exactly once")
 
     print(f"HyperBit CODAL override: codal={actual_commit}")
     print(f"HyperBit CODAL override: hvn_tx_queue_size={queue_size}")
+    print("HyperBit CODAL override: uart_tx=notify")
     print(f"HyperBit CODAL override: noinit_origin=0X{noinit_origin:08X}")
     print(f"HyperBit CODAL override: application_ram_origin=0X{app_origin:08X}")
 
