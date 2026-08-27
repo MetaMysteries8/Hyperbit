@@ -83,7 +83,7 @@ protected:
     virtual void onDataWritten(const microbit_ble_evt_write_t *params);
 
 public:
-    explicit VoiceBLEService(codal::BLEDevice &ble);
+    VoiceBLEService();
 
     bool sendControl(uint8_t code, uint8_t a=0, uint8_t b=0, uint8_t c=0);
     bool sendMic(uint8_t seq, const uint8_t *data, int len);
