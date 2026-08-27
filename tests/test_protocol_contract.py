@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import re
 import unittest
 
@@ -9,6 +10,7 @@ MAIN = (ROOT / "firmware/source/main.cpp").read_text(encoding="utf-8")
 ANIMATOR = (ROOT / "firmware/source/AliveAnimator.cpp").read_text(encoding="utf-8")
 RAINBOW = (ROOT / "firmware/source/WukongRainbow.cpp").read_text(encoding="utf-8")
 PC = (ROOT / "pc_agent/ble_link.py").read_text(encoding="utf-8")
+CODAL = json.loads((ROOT / "firmware/codal.json").read_text(encoding="utf-8"))
 
 
 def cpp_int(name: str) -> int:
@@ -44,13 +46,27 @@ class ProtocolContractTests(unittest.TestCase):
             with self.subTest(firmware=firmware_name, pc=pc_name):
                 self.assertEqual(cpp_int(firmware_name), py_int(pc_name))
 
-    def test_nus_uuid_contract_is_standard(self):
+    def test_codal_uart_gatt_capability_is_advertised(self):
+        self.assertEqual(cpp_int("HYPERBIT_CAP_CODAL_UART_GATT"), 0x20)
+        capabilities_line = next(
+            line for line in HEADER.splitlines()
+            if line.startswith("#define HYPERBIT_CAPABILITIES")
+        )
+        self.assertIn("HYPERBIT_CAP_CODAL_UART_GATT", capabilities_line)
+
+    def test_nus_uuid_contract_is_standard_and_owned_by_codal_uart(self):
         self.assertIn('SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"', PC)
         self.assertIn('RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"', PC)
         self.assertIn('TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"', PC)
-        self.assertIn("static const uint16_t NUS_SERVICE_UUID = 0x0001;", SERVICE)
-        self.assertIn("static const uint16_t NUS_RX_UUID = 0x0002;", SERVICE)
-        self.assertIn("static const uint16_t NUS_TX_UUID = 0x0003;", SERVICE)
+
+        self.assertIn("class VoiceBLEService : public codal::MicroBitUARTService", HEADER)
+        self.assertIn("MicroBitUARTService(*MicroBitBLEManager::getInstance())", SERVICE)
+        self.assertIn("HB_NUS_TX == MicroBitUARTService::mbbs_cIdxTX", SERVICE)
+        self.assertIn("HB_NUS_RX == MicroBitUARTService::mbbs_cIdxRX", SERVICE)
+        self.assertNotRegex(SERVICE, r"(?m)^\s*RegisterBaseUUID\(")
+        self.assertNotRegex(SERVICE, r"(?m)^\s*CreateService\(")
+        self.assertNotRegex(SERVICE, r"(?m)^\s*CreateCharacteristic\(")
+        self.assertEqual(CODAL["config"].get("MICROBIT_BLE_NORDIC_STYLE_UART"), 1)
 
     def test_hello_requires_tx_subscription(self):
         hello_start = SERVICE.index("if (frameType == HB_FRAME_HELLO)")
