@@ -61,8 +61,9 @@ class ProtocolContractTests(unittest.TestCase):
 
         self.assertIn("class VoiceBLEService : public codal::MicroBitUARTService", HEADER)
         self.assertIn("MicroBitUARTService(*MicroBitBLEManager::getInstance())", SERVICE)
-        self.assertIn("HB_NUS_TX == MicroBitUARTService::mbbs_cIdxTX", SERVICE)
-        self.assertIn("HB_NUS_RX == MicroBitUARTService::mbbs_cIdxRX", SERVICE)
+        self.assertIn("(int)HB_NUS_TX == (int)MicroBitUARTService::mbbs_cIdxTX", SERVICE)
+        self.assertIn("(int)HB_NUS_RX == (int)MicroBitUARTService::mbbs_cIdxRX", SERVICE)
+        self.assertIn("(int)HB_CHAR_COUNT == (int)MicroBitUARTService::mbbs_cIdxCOUNT", SERVICE)
         self.assertNotRegex(SERVICE, r"(?m)^\s*RegisterBaseUUID\(")
         self.assertNotRegex(SERVICE, r"(?m)^\s*CreateService\(")
         self.assertNotRegex(SERVICE, r"(?m)^\s*CreateCharacteristic\(")
