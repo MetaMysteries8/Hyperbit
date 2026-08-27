@@ -10,11 +10,10 @@
 #define HYPERBIT_NUS_AUDIO_PAYLOAD 17
 #define HYPERBIT_PROTOCOL_VERSION 2
 
-// Protocol v2 stays wire-compatible while the firmware revision identifies the
-// minimum implementation required by the PC. r6 moves NUS GATT registration to
-// CODAL's own MicroBitUARTService so Windows is no longer depending on a
-// HyperBit-authored service/characteristic creation path.
-#define HYPERBIT_FIRMWARE_REVISION 6
+// Protocol v2/r5 stays wire-compatible. This build adds an explicit capability
+// bit for the CODAL-owned UART GATT registration path rather than forcing every
+// existing r5 PC package to reject older, otherwise-compatible firmware.
+#define HYPERBIT_FIRMWARE_REVISION 5
 #define HYPERBIT_CAP_CONNECTION_ISOLATION   0x01
 #define HYPERBIT_CAP_SAFE_RAINBOW_PWM       0x02
 #define HYPERBIT_CAP_SEGMENTED_TTS          0x04
