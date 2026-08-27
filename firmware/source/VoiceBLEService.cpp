@@ -11,8 +11,8 @@ static_assert(HB_NUS_RX == MicroBitUARTService::mbbs_cIdxRX,
 static_assert(HB_CHAR_COUNT == MicroBitUARTService::mbbs_cIdxCOUNT,
               "HyperBit characteristic count must match CODAL UART service");
 
-VoiceBLEService::VoiceBLEService(BLEDevice &ble) :
-    MicroBitUARTService(ble),
+VoiceBLEService::VoiceBLEService() :
+    MicroBitUARTService(*MicroBitBLEManager::getInstance()),
     sessionReadyFlag(false),
     ttsReceiving(false),
     ttsReadyFlag(false),
