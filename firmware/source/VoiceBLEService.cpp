@@ -4,11 +4,11 @@ using namespace codal;
 
 static uint8_t TTS_BUFFER[HYPERBIT_MAX_TTS_ADPCM];
 
-static_assert(HB_NUS_TX == MicroBitUARTService::mbbs_cIdxTX,
+static_assert((int)HB_NUS_TX == (int)MicroBitUARTService::mbbs_cIdxTX,
               "HyperBit TX index must match CODAL UART TX index");
-static_assert(HB_NUS_RX == MicroBitUARTService::mbbs_cIdxRX,
+static_assert((int)HB_NUS_RX == (int)MicroBitUARTService::mbbs_cIdxRX,
               "HyperBit RX index must match CODAL UART RX index");
-static_assert(HB_CHAR_COUNT == MicroBitUARTService::mbbs_cIdxCOUNT,
+static_assert((int)HB_CHAR_COUNT == (int)MicroBitUARTService::mbbs_cIdxCOUNT,
               "HyperBit characteristic count must match CODAL UART service");
 
 VoiceBLEService::VoiceBLEService() :
